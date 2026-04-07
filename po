@@ -1,0 +1,394 @@
+📘 Schema Resolver – Architecture & Implementation (NiFi)
+1. Introduction
+
+Cette documentation décrit la mise en place d’un composant Schema Resolver dans Apache NiFi, permettant de récupérer dynamiquement les schémas (XML / JSON) via une API externe, avec mise en cache afin d’optimiser les performances.
+
+2. Objectifs
+
+Le composant Schema Resolver a pour objectifs :
+
+Centraliser la récupération des schémas
+Réduire les appels à l’API externe
+Améliorer la performance globale des flows NiFi
+Garantir la cohérence des schémas utilisés
+Fournir une base scalable pour les traitements futurs (validation, transformation)
+3. Périmètre
+Inclus
+Récupération de schémas via API
+Mise en cache distribuée
+Gestion des clés de schéma
+Intégration dans les flows NiFi
+Non inclus
+Validation des documents
+Transformation des données
+Gestion avancée de version (future évolution)
+4. Vue d’ensemble de l’architecture
+Principe de fonctionnement
+Incoming Document
+        ↓
+Extract Metadata (Headers)
+        ↓
+Build Cache Key
+        ↓
+Cache Lookup
+   ├── Hit → Use Cached Schema
+   └── Miss → Call Schema API
+                  ↓
+              Store in Cache
+                  ↓
+            Continue Processing
+5. Composants techniques
+5.1 Processors NiFi
+Processor	Rôle
+ListenHTTP / ConsumeKafka	Ingestion des documents
+UpdateAttribute	Construction des attributs et clés
+FetchDistributedMapCache	Lecture du cache
+InvokeHTTP	Appel API des schémas
+PutDistributedMapCache	Écriture dans le cache
+5.2 Controller Services
+MapCacheServer
+Fournit un cache clé/valeur partagé
+Déployé une seule fois (niveau root)
+Accessible par tous les nodes
+MapCacheClientService
+Interface entre les processors et le cache
+Utilisé par Fetch / Put
+6. Stratégie de clé de cache
+Construction
+schema.cache.key = ${doc.type}|${document-type}|${document-version}
+Exemple
+Format	Type	Version	Clé
+xml	invoice	v1	xml
+json	customer	v2	json
+Bonnes pratiques
+Clé déterministe
+Stable dans le temps
+Inclure type + version
+Éviter toute dépendance au contenu du payload
+7. Flux de traitement
+Étapes détaillées
+1. Réception du document
+
+Le document est reçu via HTTP, Kafka ou autre source.
+
+2. Extraction des métadonnées
+
+Les informations suivantes sont extraites des headers :
+
+document-type
+document-version
+content-type
+3. Construction des attributs
+doc.type = xml ou json
+schema.key = ${document-type}|${document-version}
+schema.cache.key = ${doc.type}|${schema.key}
+4. Recherche dans le cache
+
+Utilisation de FetchDistributedMapCache :
+
+Si trouvé → récupération immédiate
+Si absent → passage à l’appel API
+5. Appel API (cache miss)
+
+InvokeHTTP appelle le service externe de schéma :
+
+GET /schemas?type=${document-type}&version=${document-version}&format=${doc.type}
+6. Stockage en cache
+
+PutDistributedMapCache :
+
+stocke la réponse API
+clé = schema.cache.key
+7. Continuité du traitement
+
+Le schéma est disponible pour les étapes suivantes du flow.
+
+8. Contrat de l’API de schéma
+Requête
+GET /schemas?type=invoice&version=v1&format=xml
+Réponse (XML)
+{
+  "schemaType": "xsd",
+  "version": "1",
+  "schemaBody": "<xs:schema>...</xs:schema>"
+}
+Réponse (JSON)
+{
+  "schemaType": "json-schema",
+  "version": "2",
+  "schemaBody": "{...}"
+}
+9. Configuration
+MapCacheServer
+Propriété	Valeur
+Bind Address	0.0.0.0
+Port	4557
+MapCacheClientService
+Propriété	Valeur
+Hostname	nifi-cache.internal
+Port	4557
+10. Flow NiFi de référence
+ListenHTTP
+ → UpdateAttribute
+ → FetchDistributedMapCache
+      → found → continue
+      → not-found → InvokeHTTP
+                   → PutDistributedMapCache
+                   → continue
+11. Bonnes pratiques
+Performance
+Minimiser les appels API
+Utiliser cache distribué
+Nommage
+schema.cache.key
+doc.type
+schema.source
+Observabilité
+
+Ajouter :
+
+schema.source = cache | api
+12. Gestion des erreurs
+Cas	Action
+API indisponible	Retry + pénalisation
+Schéma non trouvé	Routing vers erreur
+Cache corrompu	Réinitialisation possible
+13. Considérations cluster
+Bonnes pratiques
+Un seul MapCacheServer
+Tous les nodes utilisent le même client
+Utilisation d’un DNS partagé
+À éviter
+localhost en cluster
+Multiplication des serveurs cache
+14. Sécurité
+API sécurisée (HTTPS + authentification)
+Accès contrôlé aux endpoints NiFi
+Isolation du cache
+15. Évolutions futures
+Ajout TTL sur les schémas
+Gestion de version avancée
+Intégration Redis / cache externe
+Monitoring (cache hit ratio)
+16. Conclusion
+
+Le composant Schema Resolver fournit :
+
+une architecture performante et scalable
+une réduction significative des appels API
+une gestion centralisée des schémas
+une base solide pour les traitements futurs
+💬 Si tu veux améliorer encore
+
+Je peux te faire :
+
+📊 diagramme architecture (draw.io Confluence-ready)
+🧱 version enterprise (Redis + HA + multi-env)
+🧪 runbook exploitation (incident, debug, KPI)
+📦 template Confluence avec macros (panel, expand, etc.)
+
+Dis-moi 👍
+
+template confluence 
+
+
+
+Parfait 👌 voici un template Confluence professionnel prêt à copier-coller, avec une structure propre + macros Confluence (panel, expand, code…).
+
+📘 Schema Resolver – Documentation Technique
+📌 1. Contexte
+
+{panel:title=Contexte|borderStyle=solid|borderColor=#ccc|bgColor=#F4F5F7}
+Le composant Schema Resolver implémenté dans Apache NiFi permet de récupérer dynamiquement les schémas (XML / JSON) via une API externe, tout en utilisant un cache distribué pour optimiser les performances.
+{panel}
+
+🎯 2. Objectifs
+
+{panel:title=Objectifs|bgColor=#E3FCEF}
+
+Centraliser la récupération des schémas
+Réduire les appels à l’API externe
+Améliorer les performances des flows
+Standardiser la gestion des schémas
+Préparer les futures étapes (validation, transformation)
+{panel}
+🧩 3. Périmètre
+
+{expand:title=Voir le périmètre}
+
+Inclus
+Récupération des schémas via API
+Mise en cache distribuée
+Gestion des clés de schéma
+Non inclus
+Validation des documents
+Transformation des données
+Versioning avancé
+
+{expand}
+
+🏗️ 4. Architecture
+
+{panel:title=Vue globale|bgColor=#DEEBFF}
+Incoming Document
+→ Extraction des métadonnées
+→ Construction de la clé
+→ Cache Lookup
+  ├── HIT → utilisation du cache
+  └── MISS → appel API → stockage → retour
+{panel}
+
+⚙️ 5. Composants
+🔹 Processors
+
+{expand:title=Liste des processors}
+
+ListenHTTP / ConsumeKafka → ingestion
+UpdateAttribute → construction des attributs
+FetchDistributedMapCache → lecture cache
+InvokeHTTP → appel API
+PutDistributedMapCache → écriture cache
+
+{expand}
+
+🔹 Controller Services
+
+{panel:title=Services utilisés|bgColor=#FFF4E6}
+
+MapCacheServer
+→ serveur de cache partagé
+MapCacheClientService
+→ accès au cache depuis les processors
+
+{panel}
+
+🔑 6. Stratégie de clé
+
+{panel:title=Clé de cache|bgColor=#F4F5F7}
+
+{code}
+schema.cache.key = ${doc.type}|${document-type}|${document-version}
+{code}
+
+Exemple
+xml|invoice|v1
+json|customer|v2
+
+{panel}
+
+🔄 7. Flow détaillé
+
+{expand:title=Voir les étapes détaillées}
+
+Réception du document
+Extraction des headers
+Construction des attributs
+Lookup cache
+Appel API si nécessaire
+Mise en cache
+Continuité du flow
+
+{expand}
+
+🌐 8. API de schéma
+Requête
+
+{code:language=http}
+GET /schemas?type=${document-type}&version=${document-version}&format=${doc.type}
+{code}
+
+Réponse
+
+{code:language=json}
+{
+"schemaType": "xsd",
+"version": "1",
+"schemaBody": "xs:schema
+...</xs:schema>"
+}
+{code}
+
+🧪 9. Flow NiFi
+
+{panel:title=Flow minimal|bgColor=#EAE6FF}
+
+{code}
+ListenHTTP
+→ UpdateAttribute
+→ FetchDistributedMapCache
+→ found → continue
+→ not-found → InvokeHTTP
+→ PutDistributedMapCache
+→ continue
+{code}
+
+{panel}
+
+🚀 10. Bonnes pratiques
+
+{panel:title=Best Practices|bgColor=#E3FCEF}
+
+Utiliser une clé stable et déterministe
+Ne jamais utiliser localhost en cluster
+Centraliser les services
+Ajouter attribut de debug
+
+{code}
+schema.source = cache | api
+{code}
+
+{panel}
+
+⚠️ 11. Risques & pièges
+
+{panel:title=Points d’attention|bgColor=#FFEBE6}
+
+Mauvaise clé → cache inefficace
+Plusieurs serveurs cache → incohérence
+Mauvaise config réseau → cache inaccessible
+
+{panel}
+
+🏢 12. Déploiement cluster
+
+{expand:title=Configuration cluster}
+
+1 seul MapCacheServer
+Tous les nodes utilisent le même client
+Utiliser DNS (ex: nifi-cache.internal)
+
+{expand}
+
+🔒 13. Sécurité
+
+{panel:title=Sécurité|bgColor=#FFF4E6}
+
+API sécurisée (HTTPS, token)
+Accès NiFi restreint
+Cache non exposé publiquement
+
+{panel}
+
+📈 14. Évolutions
+
+{expand:title=Améliorations futures}
+
+TTL cache
+refresh automatique
+Redis / cache externe
+monitoring
+
+{expand}
+
+🧾 15. Conclusion
+
+{panel:title=Conclusion|bgColor=#E3FCEF}
+
+Le Schema Resolver permet :
+
+une architecture performante
+une réduction des appels API
+une gestion centralisée des schémas
+une base scalable
+
+{panel}
