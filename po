@@ -3,85 +3,105 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import javax.xml.validation.SchemaFactory
 import javax.xml.transform.stream.StreamSource
 import javax.xml.XMLConstants
+import org.apache.nifi.processor.io.InputStreamCallback
+import java.nio.charset.StandardCharsets
 import java.io.StringReader
 
 def flowFile = session.get()
 if (!flowFile) return
 
-// ── Resolve content type safely (supports both 'json'/'xml' and MIME types) ──
-def rawContentType = flowFile.getAttribute('content.type')
-def contentType = rawContentType?.toLowerCase()?.contains('json') ? 'json'
-                : rawContentType?.toLowerCase()?.contains('xml')  ? 'xml'
-                : null
+def rawContentType = flowFile.getAttribute('mime.type') ?: flowFile.getAttribute('content.type')
+def raw = rawContentType?.toLowerCase()
 
-// ── Fetch schema from attribute (populated by FetchDistributedMapCache) ──────
+def contentType = raw?.contains('json') ? 'json' :
+                  raw?.contains('xml')  ? 'xml'  :
+                  null
+
 def schemaStr = flowFile.getAttribute('validation.schema')
 
-// ── Guard: missing schema ─────────────────────────────────────────────────────
-if (!schemaStr) {
-    flowFile = session.putAttribute(flowFile, 'validation.errors', 
+if (!schemaStr?.trim()) {
+    flowFile = session.putAttribute(flowFile, 'validation.status', 'invalid')
+    flowFile = session.putAttribute(flowFile, 'validation.errors',
         'No schema found in FlowFile attribute [validation.schema]')
     session.transfer(flowFile, REL_FAILURE)
     return
 }
 
-// ── Guard: missing or unknown content type ────────────────────────────────────
 if (!contentType) {
-    flowFile = session.putAttribute(flowFile, 'validation.errors', 
-        "Unknown or missing content.type [${rawContentType}]. Expected json or xml (or MIME equivalent).")
+    flowFile = session.putAttribute(flowFile, 'validation.status', 'invalid')
+    flowFile = session.putAttribute(flowFile, 'validation.errors',
+        "Unknown or missing mime/content type [${rawContentType}]. Expected JSON or XML.")
     session.transfer(flowFile, REL_FAILURE)
     return
 }
 
-// ── Read FlowFile content ─────────────────────────────────────────────────────
 def content = ''
 session.read(flowFile, { inputStream ->
-    content = inputStream.text
+    content = inputStream.getText(StandardCharsets.UTF_8.name())
 } as InputStreamCallback)
 
-// ── Guard: empty content ──────────────────────────────────────────────────────
 if (!content?.trim()) {
+    flowFile = session.putAttribute(flowFile, 'validation.status', 'invalid')
     flowFile = session.putAttribute(flowFile, 'validation.errors', 'FlowFile content is empty')
     session.transfer(flowFile, REL_FAILURE)
     return
 }
 
-// ── Validate ──────────────────────────────────────────────────────────────────
 try {
     if (contentType == 'json') {
-        // ── JSON Validation ───────────────────────────────────────────────────
-        def mapper  = new ObjectMapper()
+        def mapper = new ObjectMapper()
         def factory = JsonSchemaFactory.getInstance(SpecVersion.VersionFlag.V7)
 
         def schemaNode = mapper.readTree(schemaStr)
-        def schema     = factory.getSchema(schemaNode)
-        def jsonNode   = mapper.readTree(content)
-        def errors     = schema.validate(jsonNode)
+        def schema = factory.getSchema(schemaNode)
+        def jsonNode = mapper.readTree(content)
+        def errors = schema.validate(jsonNode)
 
         if (errors.isEmpty()) {
+            flowFile = session.putAttribute(flowFile, 'validation.status', 'valid')
+            flowFile = session.putAttribute(flowFile, 'validation.type', 'json')
             session.transfer(flowFile, REL_SUCCESS)
         } else {
-            def errorMsg = errors.collect { it.message }.join('; ')
+            def errorList = errors.collect { it.message ?: it.toString() }
+            def errorMsg = errorList.take(10).join('; ')
+            if (errorList.size() > 10) {
+                errorMsg += "; ... ${errorList.size() - 10} more errors"
+            }
+
+            flowFile = session.putAttribute(flowFile, 'validation.status', 'invalid')
+            flowFile = session.putAttribute(flowFile, 'validation.type', 'json')
             flowFile = session.putAttribute(flowFile, 'validation.errors', errorMsg)
             session.transfer(flowFile, REL_FAILURE)
         }
 
     } else if (contentType == 'xml') {
-        // ── XML Validation ────────────────────────────────────────────────────
         def schemaFactory = SchemaFactory.newInstance(XMLConstants.W3C_XML_SCHEMA_NS_URI)
-        def xsdSchema     = schemaFactory.newSchema(new StreamSource(new StringReader(schemaStr)))
-        def validator     = xsdSchema.newValidator()
+        try {
+            schemaFactory.setProperty(XMLConstants.ACCESS_EXTERNAL_DTD, "")
+            schemaFactory.setProperty(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "")
+        } catch (Exception ignored) {
+            // Some environments may not support these properties
+        }
+
+        def xsdSchema = schemaFactory.newSchema(new StreamSource(new StringReader(schemaStr)))
+        def validator = xsdSchema.newValidator()
 
         try {
             validator.validate(new StreamSource(new StringReader(content)))
+            flowFile = session.putAttribute(flowFile, 'validation.status', 'valid')
+            flowFile = session.putAttribute(flowFile, 'validation.type', 'xml')
             session.transfer(flowFile, REL_SUCCESS)
         } catch (Exception validationEx) {
-            flowFile = session.putAttribute(flowFile, 'validation.errors', validationEx.message)
+            flowFile = session.putAttribute(flowFile, 'validation.status', 'invalid')
+            flowFile = session.putAttribute(flowFile, 'validation.type', 'xml')
+            flowFile = session.putAttribute(flowFile, 'validation.errors',
+                validationEx.message ?: validationEx.toString())
             session.transfer(flowFile, REL_FAILURE)
         }
     }
-
 } catch (Exception e) {
-    flowFile = session.putAttribute(flowFile, 'validation.errors', "Script error: ${e.message}")
+    flowFile = session.putAttribute(flowFile, 'validation.status', 'invalid')
+    flowFile = session.putAttribute(flowFile, 'validation.errors',
+        "Script error: ${e.message ?: e.toString()}")
     session.transfer(flowFile, REL_FAILURE)
 }
