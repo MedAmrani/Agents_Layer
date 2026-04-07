@@ -9,12 +9,6 @@ import java.io.StringReader
 def flowFile = session.get()
 if (!flowFile) return
 
-def putError = { ff, msg ->
-    ff = session.putAttribute(ff, 'validation.status', 'invalid')
-    ff = session.putAttribute(ff, 'validation.errors', msg ?: 'Unknown validation error')
-    session.transfer(ff, REL_FAILURE)
-}
-
 def rawContentType = flowFile.getAttribute('mime.type') ?: flowFile.getAttribute('content.type')
 def raw = rawContentType?.toLowerCase()
 
@@ -33,7 +27,10 @@ if (raw?.contains('json')) {
 }
 
 if (!contentType) {
-    putError(flowFile, "Unknown or missing content type. mime.type/content.type=[${rawContentType}]")
+    flowFile = session.putAttribute(flowFile, 'validation.status', 'invalid')
+    flowFile = session.putAttribute(flowFile, 'validation.errors',
+        "Unknown or missing content type. mime.type/content.type=[${rawContentType}]")
+    session.transfer(flowFile, REL_FAILURE)
     return
 }
 
@@ -43,61 +40,46 @@ session.read(flowFile, { inputStream ->
 } as InputStreamCallback)
 
 if (!content?.trim()) {
-    putError(flowFile, 'FlowFile content is empty')
+    flowFile = session.putAttribute(flowFile, 'validation.status', 'invalid')
+    flowFile = session.putAttribute(flowFile, 'validation.errors', 'FlowFile content is empty')
+    session.transfer(flowFile, REL_FAILURE)
     return
 }
 
-try {
-    if (contentType == 'json') {
-        // JSON syntax validation only
-        try {
-            def mapper = new ObjectMapper()
-            mapper.readTree(content)
+if (contentType == 'json') {
+    def mapper = new ObjectMapper()
+    mapper.readTree(content)
 
-            flowFile = session.putAttribute(flowFile, 'validation.status', 'valid')
-            flowFile = session.putAttribute(flowFile, 'validation.type', 'json')
-            flowFile = session.putAttribute(flowFile, 'validation.mode', 'json-well-formed-only')
-            session.transfer(flowFile, REL_SUCCESS)
-        } catch (Exception jsonEx) {
-            putError(flowFile, "Invalid JSON: ${jsonEx.message ?: jsonEx.toString()}")
-        }
-        return
-    }
-
-    if (contentType == 'xml') {
-        def schemaStr = flowFile.getAttribute('validation.schema')
-
-        if (!schemaStr?.trim()) {
-            putError(flowFile, 'No XSD schema found in FlowFile attribute [validation.schema]')
-            return
-        }
-
-        def schemaFactory = SchemaFactory.newInstance(XMLConstants.W3C_XML_SCHEMA_NS_URI)
-
-        try {
-            schemaFactory.setProperty(XMLConstants.ACCESS_EXTERNAL_DTD, "")
-            schemaFactory.setProperty(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "")
-        } catch (Exception ignored) {
-            // Some JVM/NiFi environments may not support these properties
-        }
-
-        def xsdSchema = schemaFactory.newSchema(new StreamSource(new StringReader(schemaStr)))
-        def validator = xsdSchema.newValidator()
-
-        try {
-            validator.validate(new StreamSource(new StringReader(content)))
-
-            flowFile = session.putAttribute(flowFile, 'validation.status', 'valid')
-            flowFile = session.putAttribute(flowFile, 'validation.type', 'xml')
-            flowFile = session.putAttribute(flowFile, 'validation.mode', 'xsd')
-            session.transfer(flowFile, REL_SUCCESS)
-        } catch (Exception xmlValidationEx) {
-            putError(flowFile, "Invalid XML against XSD: ${xmlValidationEx.message ?: xmlValidationEx.toString()}")
-        }
-        return
-    }
-
-    putError(flowFile, "Unsupported content type [${contentType}]")
-} catch (Exception e) {
-    putError(flowFile, "Script error: ${e.message ?: e.toString()}")
+    flowFile = session.putAttribute(flowFile, 'validation.status', 'valid')
+    flowFile = session.putAttribute(flowFile, 'validation.type', 'json')
+    flowFile = session.putAttribute(flowFile, 'validation.mode', 'json-well-formed-only')
+    session.transfer(flowFile, REL_SUCCESS)
+    return
 }
+
+if (contentType == 'xml') {
+    def schemaStr = flowFile.getAttribute('validation.schema')
+
+    if (!schemaStr?.trim()) {
+        flowFile = session.putAttribute(flowFile, 'validation.status', 'invalid')
+        flowFile = session.putAttribute(flowFile, 'validation.errors',
+            'No XSD schema found in FlowFile attribute [validation.schema]')
+        session.transfer(flowFile, REL_FAILURE)
+        return
+    }
+
+    def schemaFactory = SchemaFactory.newInstance(XMLConstants.W3C_XML_SCHEMA_NS_URI)
+    def xsdSchema = schemaFactory.newSchema(new StreamSource(new StringReader(schemaStr)))
+    def validator = xsdSchema.newValidator()
+    validator.validate(new StreamSource(new StringReader(content)))
+
+    flowFile = session.putAttribute(flowFile, 'validation.status', 'valid')
+    flowFile = session.putAttribute(flowFile, 'validation.type', 'xml')
+    flowFile = session.putAttribute(flowFile, 'validation.mode', 'xsd')
+    session.transfer(flowFile, REL_SUCCESS)
+    return
+}
+
+flowFile = session.putAttribute(flowFile, 'validation.status', 'invalid')
+flowFile = session.putAttribute(flowFile, 'validation.errors', "Unsupported content type [${contentType}]")
+session.transfer(flowFile, REL_FAILURE)
