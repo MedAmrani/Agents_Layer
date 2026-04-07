@@ -1,9 +1,16 @@
-import com.networknt.schema.JsonSchemaFactory
-import com.networknt.schema.SpecVersion
+{
+  "type": "record",
+  "name": "Document",
+  "fields": [
+    { "name": "documentType", "type": "string" },
+    { "name": "amount", "type": "double" }
+  ]
+}
 
-def flowFile = session.get()
-if (!flowFile) return
 
-flowFile = session.putAttribute(flowFile, "test.class", JsonSchemaFactory.class.getName())
-flowFile = session.putAttribute(flowFile, "test.versionflag", SpecVersion.VersionFlag.V7.toString())
-session.transfer(flowFile, REL_SUCCESS)
+===
+
+{
+  "documentType": "invoice",
+  "amount": 150.00
+}
