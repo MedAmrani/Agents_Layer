@@ -1,16 +1,61 @@
-{
-  "type": "record",
-  "name": "Document",
-  "fields": [
-    { "name": "documentType", "type": "string" },
-    { "name": "amount", "type": "double" }
-  ]
+import javax.xml.validation.SchemaFactory
+import javax.xml.validation.Schema
+import javax.xml.validation.Validator
+import javax.xml.transform.stream.StreamSource
+import org.xml.sax.SAXException
+import java.io.StringReader
+import java.io.InputStream
+
+def flowFile = session.get()
+if (!flowFile) return
+
+def xsdContent = flowFile.getAttribute('xsd.content')
+def artifactId  = flowFile.getAttribute('schema.artifact.id')
+
+// vérification préalable
+if (!xsdContent) {
+    flowFile = session.putAttribute(flowFile, 'validation.error', 
+        "Attribut xsd.content manquant pour ${artifactId}")
+    session.transfer(flowFile, REL_FAILURE)
+    return
 }
 
+try {
+    // construire le schema depuis le contenu de l'attribut
+    def factory = SchemaFactory.newInstance(
+        javax.xml.XMLConstants.W3C_XML_SCHEMA_NS_URI
+    )
+    def schemaSource = new StreamSource(new StringReader(xsdContent))
+    def schema = factory.newSchema(schemaSource)
+    def validator = schema.newValidator()
 
-===
+    // lire le contenu du FlowFile et valider
+    session.read(flowFile, { inputStream ->
+        try {
+            def xmlSource = new StreamSource(inputStream)
+            validator.validate(xmlSource)
+        } catch (SAXException e) {
+            throw new RuntimeException(e.getMessage())
+        }
+    } as org.apache.nifi.processor.io.InputStreamCallback)
 
-{
-  "documentType": "invoice",
-  "amount": 150.00
+    // succès
+    flowFile = session.putAttribute(flowFile, 'validation.status', 'VALID')
+    flowFile = session.putAttribute(flowFile, 'validation.schema', artifactId)
+    session.transfer(flowFile, REL_SUCCESS)
+
+} catch (RuntimeException e) {
+    // XML invalide
+    flowFile = session.putAttribute(flowFile, 'validation.status',  'INVALID')
+    flowFile = session.putAttribute(flowFile, 'validation.error',   e.getMessage())
+    flowFile = session.putAttribute(flowFile, 'validation.schema',  artifactId)
+    session.transfer(flowFile, REL_FAILURE)
+
+} catch (Exception e) {
+    // erreur technique (XSD malformé, etc.)
+    flowFile = session.putAttribute(flowFile, 'validation.status',  'ERROR')
+    flowFile = session.putAttribute(flowFile, 'validation.error',   
+        "Erreur technique: ${e.getMessage()}")
+    flowFile = session.putAttribute(flowFile, 'validation.schema',  artifactId)
+    session.transfer(flowFile, REL_FAILURE)
 }
