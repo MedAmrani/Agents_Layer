@@ -1,61 +1,311 @@
-import javax.xml.validation.SchemaFactory
-import javax.xml.validation.Schema
-import javax.xml.validation.Validator
-import javax.xml.transform.stream.StreamSource
-import org.xml.sax.SAXException
-import java.io.StringReader
-import java.io.InputStream
+import org.yaml.snakeyaml.Yaml
+import groovy.json.JsonSlurper
+import groovy.json.JsonOutput
 
+// ─────────────────────────────────────────────────────────────────────────────
+// STATIC CACHE — spec parsed once, reused across all FlowFiles
+// ─────────────────────────────────────────────────────────────────────────────
+@groovy.transform.Field static Map    cachedSpec     = null
+@groovy.transform.Field static String cachedSpecHash = null
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RELATIONSHIPS
+// ─────────────────────────────────────────────────────────────────────────────
+def REL_VALID   = new org.apache.nifi.processor.Relationship.Builder().name('valid').build()
+def REL_INVALID = new org.apache.nifi.processor.Relationship.Builder().name('invalid').build()
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPER — reject request with structured JSON error body
+// ─────────────────────────────────────────────────────────────────────────────
+def rejectRequest = { session, flowFile, String statusCode, String errorCode, String message ->
+    def body = JsonOutput.toJson([
+        timestamp : new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'", TimeZone.getTimeZone('UTC')),
+        status    : statusCode.toInteger(),
+        error     : errorCode,
+        message   : message,
+        path      : flowFile.getAttribute('http.request.uri') ?: 'unknown'
+    ])
+    flowFile = session.write(flowFile, { outputStream ->
+        outputStream.write(body.bytes)
+    } as org.apache.nifi.processor.io.OutputStreamCallback)
+    flowFile = session.putAttribute(flowFile, 'http.status.code',          statusCode)
+    flowFile = session.putAttribute(flowFile, 'mime.type',                 'application/json')
+    flowFile = session.putAttribute(flowFile, 'validation.error.message',  message)
+    flowFile = session.putAttribute(flowFile, 'validation.status',         'invalid')
+    session.transfer(flowFile, REL_INVALID)
+    return flowFile
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 0 — get FlowFile
+// ─────────────────────────────────────────────────────────────────────────────
 def flowFile = session.get()
 if (!flowFile) return
 
-def xsdContent = flowFile.getAttribute('xsd.content')
-def artifactId  = flowFile.getAttribute('schema.artifact.id')
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 1 — read Swagger YAML from FlowFile attribute
+// ─────────────────────────────────────────────────────────────────────────────
+def swaggerYaml = flowFile.getAttribute('swagger.spec')
 
-// vérification préalable
-if (!xsdContent) {
-    flowFile = session.putAttribute(flowFile, 'validation.error', 
-        "Attribut xsd.content manquant pour ${artifactId}")
-    session.transfer(flowFile, REL_FAILURE)
+if (!swaggerYaml?.trim()) {
+    rejectRequest(session, flowFile, '503', 'Service Unavailable',
+        'Swagger spec not available — attribute swagger.spec is empty or missing')
     return
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 2 — parse spec using static cache (only re-parses when spec changes)
+// ─────────────────────────────────────────────────────────────────────────────
 try {
-    // construire le schema depuis le contenu de l'attribut
-    def factory = SchemaFactory.newInstance(
-        javax.xml.XMLConstants.W3C_XML_SCHEMA_NS_URI
-    )
-    def schemaSource = new StreamSource(new StringReader(xsdContent))
-    def schema = factory.newSchema(schemaSource)
-    def validator = schema.newValidator()
-
-    // lire le contenu du FlowFile et valider
-    session.read(flowFile, { inputStream ->
-        try {
-            def xmlSource = new StreamSource(inputStream)
-            validator.validate(xmlSource)
-        } catch (SAXException e) {
-            throw new RuntimeException(e.getMessage())
-        }
-    } as org.apache.nifi.processor.io.InputStreamCallback)
-
-    // succès
-    flowFile = session.putAttribute(flowFile, 'validation.status', 'VALID')
-    flowFile = session.putAttribute(flowFile, 'validation.schema', artifactId)
-    session.transfer(flowFile, REL_SUCCESS)
-
-} catch (RuntimeException e) {
-    // XML invalide
-    flowFile = session.putAttribute(flowFile, 'validation.status',  'INVALID')
-    flowFile = session.putAttribute(flowFile, 'validation.error',   e.getMessage())
-    flowFile = session.putAttribute(flowFile, 'validation.schema',  artifactId)
-    session.transfer(flowFile, REL_FAILURE)
-
+    def specHash = swaggerYaml.hashCode().toString()
+    if (cachedSpec == null || cachedSpecHash != specHash) {
+        cachedSpec     = new Yaml().load(swaggerYaml) as Map
+        cachedSpecHash = specHash
+    }
 } catch (Exception e) {
-    // erreur technique (XSD malformé, etc.)
-    flowFile = session.putAttribute(flowFile, 'validation.status',  'ERROR')
-    flowFile = session.putAttribute(flowFile, 'validation.error',   
-        "Erreur technique: ${e.getMessage()}")
-    flowFile = session.putAttribute(flowFile, 'validation.schema',  artifactId)
-    session.transfer(flowFile, REL_FAILURE)
+    rejectRequest(session, flowFile, '503', 'Service Unavailable',
+        "Failed to parse Swagger spec: ${e.message}")
+    return
 }
+def spec = cachedSpec
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 3 — read request attributes
+// ─────────────────────────────────────────────────────────────────────────────
+def requestMethod = flowFile.getAttribute('http.method')?.toUpperCase()
+def requestUri    = flowFile.getAttribute('http.request.uri') ?: ''
+def contentType   = flowFile.getAttribute('http.headers.content-type') ?: ''
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 4 — extract base path (OpenAPI 3.x: servers[0].url / Swagger 2.x: basePath)
+// ─────────────────────────────────────────────────────────────────────────────
+String basePath = ''
+if (spec.servers) {
+    def serverUrl = spec.servers[0]?.url ?: ''
+    try { basePath = new URI(serverUrl).path } catch (e) { basePath = serverUrl }
+} else if (spec.basePath) {
+    basePath = spec.basePath
+}
+basePath = basePath.replaceAll('/+$', '')
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 5 — strip NiFi prefix and base path to get clean spec path
+//          /api/annuaire/v1/users/123?active=true  →  /users/123
+// ─────────────────────────────────────────────────────────────────────────────
+def nifiPrefix = '/api/annuaire/v1'
+def cleanUri   = requestUri.contains('?') ? requestUri.substring(0, requestUri.indexOf('?')) : requestUri
+
+def specPath = cleanUri
+if (specPath.startsWith(nifiPrefix)) {
+    specPath = specPath.substring(nifiPrefix.length())
+}
+if (basePath && specPath.startsWith(basePath)) {
+    specPath = specPath.substring(basePath.length())
+}
+if (!specPath || specPath.isEmpty()) specPath = '/'
+if (!specPath.startsWith('/'))       specPath = '/' + specPath
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 6 — validate HTTP method is a known verb
+// ─────────────────────────────────────────────────────────────────────────────
+if (!requestMethod) {
+    rejectRequest(session, flowFile, '400', 'Bad Request', 'HTTP method is missing')
+    return
+}
+
+def knownMethods = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']
+if (!knownMethods.contains(requestMethod)) {
+    rejectRequest(session, flowFile, '405', 'Method Not Allowed',
+        "Unknown HTTP method: '${requestMethod}'")
+    return
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 7 — match incoming path against spec paths
+//          supports exact match and path parameters  /users/{id}  →  /users/123
+// ─────────────────────────────────────────────────────────────────────────────
+def paths = spec.paths as Map ?: [:]
+String matchedSpecPath  = null
+
+for (def entry : paths.entrySet()) {
+    def templatePath = entry.key as String
+
+    // exact match
+    if (templatePath == specPath) {
+        matchedSpecPath = templatePath
+        break
+    }
+
+    // path parameter match: replace {param} with regex [^/]+
+    def regexPath = templatePath.replaceAll('\\{[^/]+\\}', '[^/]+')
+    if (specPath.matches(regexPath)) {
+        matchedSpecPath = templatePath
+        break
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 8 — validate path exists in spec
+// ─────────────────────────────────────────────────────────────────────────────
+if (!matchedSpecPath) {
+    rejectRequest(session, flowFile, '404', 'Not Found',
+        "Path '${specPath}' is not defined in the API specification")
+    return
+}
+
+def pathItem = paths[matchedSpecPath] as Map ?: [:]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 9 — validate HTTP method is allowed on this path
+// ─────────────────────────────────────────────────────────────────────────────
+def httpVerbs = ['get', 'post', 'put', 'delete', 'patch', 'head', 'options']
+
+if (!pathItem.containsKey(requestMethod.toLowerCase())) {
+    def allowedMethods = pathItem.keySet()
+        .findAll { httpVerbs.contains(it) }
+        .collect  { it.toUpperCase() }
+        .join(', ')
+    rejectRequest(session, flowFile, '405', 'Method Not Allowed',
+        "Method '${requestMethod}' is not allowed on '${specPath}'. Allowed: ${allowedMethods}")
+    return
+}
+
+def matchedOperation = pathItem[requestMethod.toLowerCase()] as Map ?: [:]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 10 — validate required QUERY parameters
+// ─────────────────────────────────────────────────────────────────────────────
+def parameters  = (matchedOperation.parameters ?: pathItem.parameters ?: []) as List
+def queryString = requestUri.contains('?') ? requestUri.substring(requestUri.indexOf('?') + 1) : ''
+def queryParams = queryString ? queryString.split('&').collectEntries { param ->
+    def parts = param.split('=', 2)
+    [(URLDecoder.decode(parts[0], 'UTF-8').trim()): (parts.size() > 1 ? parts[1].trim() : '')]
+} : [:]
+
+def missingQueryParams = parameters
+    .findAll { (it as Map).in == 'query' && (it as Map).required == true }
+    .findAll { !queryParams.containsKey((it as Map).name as String) }
+    .collect { (it as Map).name }
+
+if (missingQueryParams) {
+    rejectRequest(session, flowFile, '400', 'Bad Request',
+        "Missing required query parameter(s): ${missingQueryParams.join(', ')}")
+    return
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 11 — validate required PATH parameters are not empty
+// ─────────────────────────────────────────────────────────────────────────────
+def templateSegments = matchedSpecPath.split('/')
+def actualSegments   = specPath.split('/')
+def missingPathParams = []
+
+templateSegments.eachWithIndex { seg, i ->
+    if (seg.startsWith('{') && seg.endsWith('}')) {
+        def paramName = seg[1..-2]
+        def actualVal = (i < actualSegments.size()) ? actualSegments[i] : null
+        if (!actualVal?.trim()) missingPathParams << paramName
+    }
+}
+
+if (missingPathParams) {
+    rejectRequest(session, flowFile, '400', 'Bad Request',
+        "Missing required path parameter(s): ${missingPathParams.join(', ')}")
+    return
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 12 — validate Content-Type for body requests (POST / PUT / PATCH)
+// ─────────────────────────────────────────────────────────────────────────────
+def bodyMethods = ['POST', 'PUT', 'PATCH']
+
+if (bodyMethods.contains(requestMethod)) {
+
+    // OpenAPI 3.x — requestBody
+    def requestBody = matchedOperation.requestBody as Map
+    if (requestBody) {
+        if (requestBody.required == true && !contentType?.trim()) {
+            rejectRequest(session, flowFile, '400', 'Bad Request',
+                'Content-Type header is required for this request')
+            return
+        }
+        def allowedContentTypes = (requestBody.content as Map)?.keySet() ?: []
+        if (allowedContentTypes && contentType) {
+            def normalizedCt = contentType.split(';')[0].trim()
+            if (!allowedContentTypes.any { it == normalizedCt || it == '*/*' }) {
+                rejectRequest(session, flowFile, '415', 'Unsupported Media Type',
+                    "Content-Type '${normalizedCt}' is not supported. Allowed: ${allowedContentTypes.join(', ')}")
+                return
+            }
+        }
+    }
+
+    // Swagger 2.x — consumes (operation level overrides global)
+    def consumes = (matchedOperation.consumes ?: spec.consumes) as List
+    if (consumes && contentType) {
+        def normalizedCt = contentType.split(';')[0].trim()
+        if (!consumes.any { it == normalizedCt || it == '*/*' }) {
+            rejectRequest(session, flowFile, '415', 'Unsupported Media Type',
+                "Content-Type '${normalizedCt}' is not supported. Allowed: ${consumes.join(', ')}")
+            return
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 13 — validate required JSON body fields (top-level only)
+// ─────────────────────────────────────────────────────────────────────────────
+if (bodyMethods.contains(requestMethod) && contentType.contains('application/json')) {
+    try {
+        def bodyText = flowFile.getAttribute('http.request.body') ?: ''
+
+        // fallback: read from FlowFile content if attribute not set
+        if (!bodyText?.trim()) {
+            session.read(flowFile, { inputStream ->
+                bodyText = inputStream.text
+            } as org.apache.nifi.processor.io.InputStreamCallback)
+        }
+
+        if (bodyText?.trim()) {
+            def body = new JsonSlurper().parseText(bodyText) as Map
+
+            // resolve schema — OpenAPI 3.x
+            def schema = matchedOperation.requestBody
+                ?.content?.get('application/json')
+                ?.schema as Map
+
+            // resolve schema — Swagger 2.x (body parameter)
+            if (!schema) {
+                def bodyParam = parameters.find { (it as Map).in == 'body' }
+                schema = (bodyParam as Map)?.schema as Map
+            }
+
+            if (schema) {
+                def requiredFields = schema.required as List ?: []
+                def missingFields  = requiredFields.findAll { !body.containsKey(it) }
+                if (missingFields) {
+                    rejectRequest(session, flowFile, '400', 'Bad Request',
+                        "Missing required field(s) in request body: ${missingFields.join(', ')}")
+                    return
+                }
+            }
+        } else if (matchedOperation.requestBody?.required == true) {
+            rejectRequest(session, flowFile, '400', 'Bad Request',
+                'Request body is required but was empty')
+            return
+        }
+
+    } catch (Exception e) {
+        rejectRequest(session, flowFile, '400', 'Bad Request',
+            "Request body is not valid JSON: ${e.message}")
+        return
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 14 — ALL CHECKS PASSED → transfer to valid
+// ─────────────────────────────────────────────────────────────────────────────
+flowFile = session.putAttribute(flowFile, 'validation.status',          'valid')
+flowFile = session.putAttribute(flowFile, 'validation.matched.path',    matchedSpecPath)
+flowFile = session.putAttribute(flowFile, 'validation.matched.method',  requestMethod)
+session.transfer(flowFile, REL_VALID)
