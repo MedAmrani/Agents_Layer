@@ -9,31 +9,36 @@ import groovy.json.JsonOutput
 @groovy.transform.Field static String cachedSpecHash = null
 
 // ─────────────────────────────────────────────────────────────────────────────
-// RELATIONSHIPS
+// HELPER — build a professional RFC 7807 Problem Details error response
+// https://datatracker.ietf.org/doc/html/rfc7807
 // ─────────────────────────────────────────────────────────────────────────────
-def REL_VALID   = new org.apache.nifi.processor.Relationship.Builder().name('valid').build()
-def REL_INVALID = new org.apache.nifi.processor.Relationship.Builder().name('invalid').build()
+def buildErrorResponse = { int status, String title, String detail, String instance, Map extensions = [:] ->
+    def body = [
+        type    : "https://annuaire.bnpparibas.com/errors/${title.toLowerCase().replace(' ', '-')}",
+        title   : title,
+        status  : status,
+        detail  : detail,
+        instance: instance,
+        timestamp: new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'", TimeZone.getTimeZone('UTC'))
+    ] + extensions
+    return JsonOutput.prettyPrint(JsonOutput.toJson(body))
+}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HELPER — reject request with structured JSON error body
-// ─────────────────────────────────────────────────────────────────────────────
-def rejectRequest = { session, flowFile, String statusCode, String errorCode, String message ->
-    def body = JsonOutput.toJson([
-        timestamp : new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'", TimeZone.getTimeZone('UTC')),
-        status    : statusCode.toInteger(),
-        error     : errorCode,
-        message   : message,
-        path      : flowFile.getAttribute('http.request.uri') ?: 'unknown'
-    ])
+def rejectRequest = { session, flowFile, int status, String title, String detail, Map extensions = [:] ->
+    def instance = flowFile.getAttribute('http.request.uri') ?: 'unknown'
+    def body     = buildErrorResponse(status, title, detail, instance, extensions)
+
     flowFile = session.write(flowFile, { outputStream ->
-        outputStream.write(body.bytes)
+        outputStream.write(body.getBytes('UTF-8'))
     } as org.apache.nifi.processor.io.OutputStreamCallback)
-    flowFile = session.putAttribute(flowFile, 'http.status.code',          statusCode)
-    flowFile = session.putAttribute(flowFile, 'mime.type',                 'application/json')
-    flowFile = session.putAttribute(flowFile, 'validation.error.message',  message)
-    flowFile = session.putAttribute(flowFile, 'validation.status',         'invalid')
-    session.transfer(flowFile, REL_INVALID)
-    return flowFile
+
+    flowFile = session.putAttribute(flowFile, 'http.status.code',         status.toString())
+    flowFile = session.putAttribute(flowFile, 'mime.type',                'application/problem+json')
+    flowFile = session.putAttribute(flowFile, 'validation.status',        'invalid')
+    flowFile = session.putAttribute(flowFile, 'validation.error.title',   title)
+    flowFile = session.putAttribute(flowFile, 'validation.error.detail',  detail)
+
+    session.transfer(flowFile, REL_FAILURE)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -48,13 +53,16 @@ if (!flowFile) return
 def swaggerYaml = flowFile.getAttribute('swagger.spec')
 
 if (!swaggerYaml?.trim()) {
-    rejectRequest(session, flowFile, '503', 'Service Unavailable',
-        'Swagger spec not available — attribute swagger.spec is empty or missing')
+    rejectRequest(session, flowFile, 503,
+        'Service Unavailable',
+        'The API specification is not available. The gateway cannot validate this request. Please contact the platform team.',
+        [support: 'platform-team@bnpparibas.com']
+    )
     return
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STEP 2 — parse spec using static cache (only re-parses when spec changes)
+// STEP 2 — parse spec using static cache (re-parses only when spec changes)
 // ─────────────────────────────────────────────────────────────────────────────
 try {
     def specHash = swaggerYaml.hashCode().toString()
@@ -63,8 +71,11 @@ try {
         cachedSpecHash = specHash
     }
 } catch (Exception e) {
-    rejectRequest(session, flowFile, '503', 'Service Unavailable',
-        "Failed to parse Swagger spec: ${e.message}")
+    rejectRequest(session, flowFile, 503,
+        'Service Unavailable',
+        "The API specification could not be parsed. Cause: ${e.message}",
+        [support: 'platform-team@bnpparibas.com']
+    )
     return
 }
 def spec = cachedSpec
@@ -77,7 +88,9 @@ def requestUri    = flowFile.getAttribute('http.request.uri') ?: ''
 def contentType   = flowFile.getAttribute('http.headers.content-type') ?: ''
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STEP 4 — extract base path (OpenAPI 3.x: servers[0].url / Swagger 2.x: basePath)
+// STEP 4 — extract base path
+//          OpenAPI 3.x → servers[0].url
+//          Swagger 2.x → basePath
 // ─────────────────────────────────────────────────────────────────────────────
 String basePath = ''
 if (spec.servers) {
@@ -89,54 +102,52 @@ if (spec.servers) {
 basePath = basePath.replaceAll('/+$', '')
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STEP 5 — strip NiFi prefix and base path to get clean spec path
+// STEP 5 — compute clean spec path by stripping NiFi prefix and base path
 //          /api/annuaire/v1/users/123?active=true  →  /users/123
 // ─────────────────────────────────────────────────────────────────────────────
 def nifiPrefix = '/api/annuaire/v1'
 def cleanUri   = requestUri.contains('?') ? requestUri.substring(0, requestUri.indexOf('?')) : requestUri
 
 def specPath = cleanUri
-if (specPath.startsWith(nifiPrefix)) {
-    specPath = specPath.substring(nifiPrefix.length())
-}
-if (basePath && specPath.startsWith(basePath)) {
-    specPath = specPath.substring(basePath.length())
-}
+if (specPath.startsWith(nifiPrefix)) specPath = specPath.substring(nifiPrefix.length())
+if (basePath && specPath.startsWith(basePath)) specPath = specPath.substring(basePath.length())
 if (!specPath || specPath.isEmpty()) specPath = '/'
 if (!specPath.startsWith('/'))       specPath = '/' + specPath
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STEP 6 — validate HTTP method is a known verb
+// STEP 6 — validate HTTP method is present and is a known verb
 // ─────────────────────────────────────────────────────────────────────────────
-if (!requestMethod) {
-    rejectRequest(session, flowFile, '400', 'Bad Request', 'HTTP method is missing')
+if (!requestMethod?.trim()) {
+    rejectRequest(session, flowFile, 400,
+        'Bad Request',
+        'The HTTP method is missing from the request.'
+    )
     return
 }
 
 def knownMethods = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']
 if (!knownMethods.contains(requestMethod)) {
-    rejectRequest(session, flowFile, '405', 'Method Not Allowed',
-        "Unknown HTTP method: '${requestMethod}'")
+    rejectRequest(session, flowFile, 405,
+        'Method Not Allowed',
+        "'${requestMethod}' is not a recognised HTTP method. Accepted methods are: ${knownMethods.join(', ')}.",
+        [allowedMethods: knownMethods]
+    )
     return
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // STEP 7 — match incoming path against spec paths
-//          supports exact match and path parameters  /users/{id}  →  /users/123
+//          supports exact match and path parameters (/users/{id} → /users/123)
 // ─────────────────────────────────────────────────────────────────────────────
 def paths = spec.paths as Map ?: [:]
-String matchedSpecPath  = null
+String matchedSpecPath = null
 
 for (def entry : paths.entrySet()) {
     def templatePath = entry.key as String
-
-    // exact match
     if (templatePath == specPath) {
         matchedSpecPath = templatePath
         break
     }
-
-    // path parameter match: replace {param} with regex [^/]+
     def regexPath = templatePath.replaceAll('\\{[^/]+\\}', '[^/]+')
     if (specPath.matches(regexPath)) {
         matchedSpecPath = templatePath
@@ -145,11 +156,14 @@ for (def entry : paths.entrySet()) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STEP 8 — validate path exists in spec
+// STEP 8 — validate path exists in the spec
 // ─────────────────────────────────────────────────────────────────────────────
 if (!matchedSpecPath) {
-    rejectRequest(session, flowFile, '404', 'Not Found',
-        "Path '${specPath}' is not defined in the API specification")
+    rejectRequest(session, flowFile, 404,
+        'Not Found',
+        "The path '${specPath}' does not exist in the Annuaire API. Please verify the endpoint URL.",
+        [requestedPath: specPath]
+    )
     return
 }
 
@@ -164,9 +178,12 @@ if (!pathItem.containsKey(requestMethod.toLowerCase())) {
     def allowedMethods = pathItem.keySet()
         .findAll { httpVerbs.contains(it) }
         .collect  { it.toUpperCase() }
-        .join(', ')
-    rejectRequest(session, flowFile, '405', 'Method Not Allowed',
-        "Method '${requestMethod}' is not allowed on '${specPath}'. Allowed: ${allowedMethods}")
+        .sort()
+    rejectRequest(session, flowFile, 405,
+        'Method Not Allowed',
+        "The method '${requestMethod}' is not allowed on '${specPath}'. Please use one of the allowed methods.",
+        [allowedMethods: allowedMethods, requestedMethod: requestMethod]
+    )
     return
 }
 
@@ -185,19 +202,22 @@ def queryParams = queryString ? queryString.split('&').collectEntries { param ->
 def missingQueryParams = parameters
     .findAll { (it as Map).in == 'query' && (it as Map).required == true }
     .findAll { !queryParams.containsKey((it as Map).name as String) }
-    .collect { (it as Map).name }
+    .collect { (it as Map).name as String }
 
 if (missingQueryParams) {
-    rejectRequest(session, flowFile, '400', 'Bad Request',
-        "Missing required query parameter(s): ${missingQueryParams.join(', ')}")
+    rejectRequest(session, flowFile, 400,
+        'Bad Request',
+        "The following required query parameter(s) are missing: ${missingQueryParams.join(', ')}. Please include them in the request URL.",
+        [missingParameters: missingQueryParams, location: 'query']
+    )
     return
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // STEP 11 — validate required PATH parameters are not empty
 // ─────────────────────────────────────────────────────────────────────────────
-def templateSegments = matchedSpecPath.split('/')
-def actualSegments   = specPath.split('/')
+def templateSegments  = matchedSpecPath.split('/')
+def actualSegments    = specPath.split('/')
 def missingPathParams = []
 
 templateSegments.eachWithIndex { seg, i ->
@@ -209,8 +229,11 @@ templateSegments.eachWithIndex { seg, i ->
 }
 
 if (missingPathParams) {
-    rejectRequest(session, flowFile, '400', 'Bad Request',
-        "Missing required path parameter(s): ${missingPathParams.join(', ')}")
+    rejectRequest(session, flowFile, 400,
+        'Bad Request',
+        "The following required path parameter(s) are missing or empty: ${missingPathParams.join(', ')}.",
+        [missingParameters: missingPathParams, location: 'path']
+    )
     return
 }
 
@@ -225,16 +248,21 @@ if (bodyMethods.contains(requestMethod)) {
     def requestBody = matchedOperation.requestBody as Map
     if (requestBody) {
         if (requestBody.required == true && !contentType?.trim()) {
-            rejectRequest(session, flowFile, '400', 'Bad Request',
-                'Content-Type header is required for this request')
+            rejectRequest(session, flowFile, 400,
+                'Bad Request',
+                "A 'Content-Type' header is required for ${requestMethod} requests on '${specPath}' but was not provided."
+            )
             return
         }
         def allowedContentTypes = (requestBody.content as Map)?.keySet() ?: []
-        if (allowedContentTypes && contentType) {
+        if (allowedContentTypes && contentType?.trim()) {
             def normalizedCt = contentType.split(';')[0].trim()
             if (!allowedContentTypes.any { it == normalizedCt || it == '*/*' }) {
-                rejectRequest(session, flowFile, '415', 'Unsupported Media Type',
-                    "Content-Type '${normalizedCt}' is not supported. Allowed: ${allowedContentTypes.join(', ')}")
+                rejectRequest(session, flowFile, 415,
+                    'Unsupported Media Type',
+                    "The Content-Type '${normalizedCt}' is not supported for this operation. Accepted types are: ${allowedContentTypes.join(', ')}.",
+                    [receivedContentType: normalizedCt, supportedContentTypes: allowedContentTypes.toList()]
+                )
                 return
             }
         }
@@ -242,24 +270,26 @@ if (bodyMethods.contains(requestMethod)) {
 
     // Swagger 2.x — consumes (operation level overrides global)
     def consumes = (matchedOperation.consumes ?: spec.consumes) as List
-    if (consumes && contentType) {
+    if (consumes && contentType?.trim()) {
         def normalizedCt = contentType.split(';')[0].trim()
         if (!consumes.any { it == normalizedCt || it == '*/*' }) {
-            rejectRequest(session, flowFile, '415', 'Unsupported Media Type',
-                "Content-Type '${normalizedCt}' is not supported. Allowed: ${consumes.join(', ')}")
+            rejectRequest(session, flowFile, 415,
+                'Unsupported Media Type',
+                "The Content-Type '${normalizedCt}' is not supported for this operation. Accepted types are: ${consumes.join(', ')}.",
+                [receivedContentType: normalizedCt, supportedContentTypes: consumes]
+            )
             return
         }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STEP 13 — validate required JSON body fields (top-level only)
+// STEP 13 — validate required JSON body fields (top-level)
 // ─────────────────────────────────────────────────────────────────────────────
 if (bodyMethods.contains(requestMethod) && contentType.contains('application/json')) {
     try {
         def bodyText = flowFile.getAttribute('http.request.body') ?: ''
 
-        // fallback: read from FlowFile content if attribute not set
         if (!bodyText?.trim()) {
             session.read(flowFile, { inputStream ->
                 bodyText = inputStream.text
@@ -269,12 +299,12 @@ if (bodyMethods.contains(requestMethod) && contentType.contains('application/jso
         if (bodyText?.trim()) {
             def body = new JsonSlurper().parseText(bodyText) as Map
 
-            // resolve schema — OpenAPI 3.x
+            // OpenAPI 3.x schema
             def schema = matchedOperation.requestBody
                 ?.content?.get('application/json')
                 ?.schema as Map
 
-            // resolve schema — Swagger 2.x (body parameter)
+            // Swagger 2.x body parameter schema
             if (!schema) {
                 def bodyParam = parameters.find { (it as Map).in == 'body' }
                 schema = (bodyParam as Map)?.schema as Map
@@ -284,28 +314,35 @@ if (bodyMethods.contains(requestMethod) && contentType.contains('application/jso
                 def requiredFields = schema.required as List ?: []
                 def missingFields  = requiredFields.findAll { !body.containsKey(it) }
                 if (missingFields) {
-                    rejectRequest(session, flowFile, '400', 'Bad Request',
-                        "Missing required field(s) in request body: ${missingFields.join(', ')}")
+                    rejectRequest(session, flowFile, 400,
+                        'Bad Request',
+                        "The request body is missing the following required field(s): ${missingFields.join(', ')}. Please refer to the API specification.",
+                        [missingFields: missingFields, location: 'body']
+                    )
                     return
                 }
             }
-        } else if (matchedOperation.requestBody?.required == true) {
-            rejectRequest(session, flowFile, '400', 'Bad Request',
-                'Request body is required but was empty')
+        } else if ((matchedOperation.requestBody as Map)?.required == true) {
+            rejectRequest(session, flowFile, 400,
+                'Bad Request',
+                "A request body is required for ${requestMethod} requests on '${specPath}' but the body was empty."
+            )
             return
         }
 
     } catch (Exception e) {
-        rejectRequest(session, flowFile, '400', 'Bad Request',
-            "Request body is not valid JSON: ${e.message}")
+        rejectRequest(session, flowFile, 400,
+            'Bad Request',
+            "The request body could not be parsed as valid JSON. Please verify the body format. Cause: ${e.message}"
+        )
         return
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STEP 14 — ALL CHECKS PASSED → transfer to valid
+// STEP 14 — ALL CHECKS PASSED → transfer to success
 // ─────────────────────────────────────────────────────────────────────────────
-flowFile = session.putAttribute(flowFile, 'validation.status',          'valid')
-flowFile = session.putAttribute(flowFile, 'validation.matched.path',    matchedSpecPath)
-flowFile = session.putAttribute(flowFile, 'validation.matched.method',  requestMethod)
-session.transfer(flowFile, REL_VALID)
+flowFile = session.putAttribute(flowFile, 'validation.status',         'valid')
+flowFile = session.putAttribute(flowFile, 'validation.matched.path',   matchedSpecPath)
+flowFile = session.putAttribute(flowFile, 'validation.matched.method', requestMethod)
+session.transfer(flowFile, REL_SUCCESS)
