@@ -1,19 +1,8 @@
-// resolve requestBody — inline or $ref to requestBodies
-            def requestBodyDef = matchedOperation.requestBody as Map
-            if (requestBodyDef?.'$ref') {
-                def refName = requestBodyDef.'$ref'.tokenize('/').last()
-                requestBodyDef = spec.components?.requestBodies?.get(refName) as Map
-            }
+Ce document décrit la procédure complète pour configurer l'authentification OAuth2 dans Apache NiFi 2.8 en utilisant le Controller Service StandardOauth2AccessTokenProvider, un proxy réseau d'entreprise et un contexte SSL personnalisé.
 
-            // resolve schema — inline or $ref to components/schemas
-            def schema = requestBodyDef?.content?.get('application/json')?.schema as Map
-            if (schema?.'$ref') {
-                def refName = schema.'$ref'.tokenize('/').last()
-                schema = spec.components?.schemas?.get(refName) as Map
-            }
-
-            // Swagger 2.x body parameter schema
-            if (!schema) {
-                def bodyParam = parameters.find { (it as Map).in == 'body' }
-                schema = (bodyParam as Map)?.schema as Map
-            }
+Il couvre les sujets suivants :
+•	Configuration du Controller Service OAuth2 (StandardOauth2AccessTokenProvider)
+•	Configuration du proxy réseau (StandardProxyConfigurationService)
+•	Configuration du contexte SSL (StandardRestrictedSSLContextService)
+•	Configuration du processor InvokeHTTP avec OAuth2
+•	Gestion des erreurs et du renouvellement automatique de token
