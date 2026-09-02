@@ -1,78 +1,52 @@
-<soap:Body>
-    <ctyp:ExecuteChangesRequest refresh="true">
+import org.apache.commons.io.IOUtils
+import java.nio.charset.StandardCharsets
 
-      <!-- ChangeRequest 1 : création du document (identique à avant) -->
-      <ctyp:ChangeRequest id="1">
-        <ctyp:TargetSpecification xsi:type="ctyp:ObjectStoreSpecification"
-             objectStore="${xmlEscape(osSymbolic)}"/>
+def flowFile = session.get()
+if (!flowFile) return
 
-        <ctyp:Action xsi:type="ctyp:CreateAction"
-             classId="${xmlEscape(docClass)}"
-             autoUniqueContainmentName="0"/>
+// Récupère les attributs nécessaires
+def jsonPayload = flowFile.getAttribute('json.payload') ?: '{}'
+def xmlFilename = flowFile.getAttribute('filename') ?: 'invoice.xml'
 
-        <ctyp:Action xsi:type="ctyp:CheckinAction"
-             autoClassify="false"
-             checkinMinorVersion="false"
-             definesSecurityParentage="1"/>
+// Génère une boundary unique
+def boundary = "----NiFiBoundary" + System.currentTimeMillis()
 
-        <ctyp:ActionProperties>
-          <ctyp:Property xsi:type="ctyp:SingletonString" propertyId="DocumentTitle">
-            <ctyp:Value>${xmlEscape(fileName)}</ctyp:Value>
-          </ctyp:Property>
-          <ctyp:Property xsi:type="ctyp:SingletonString" propertyId="MimeType">
-            <ctyp:Value>${mimeType}</ctyp:Value>
-          </ctyp:Property>
-          <ctyp:Property xsi:type="ctyp:ListOfObject" propertyId="ContentElements" listMode="Replace">
-            <ctyp:Value xsi:type="ctyp:ContentTransfer" classId="ContentTransfer" dependentAction="Insert">
-              <ctyp:Property xsi:type="ctyp:SingletonString" propertyId="RetrievalName">
-                <ctyp:Value>${xmlEscape(fileName)}</ctyp:Value>
-              </ctyp:Property>
-              <ctyp:Property xsi:type="ctyp:SingletonString" propertyId="ContentType">
-                <ctyp:Value>${mimeType}</ctyp:Value>
-              </ctyp:Property>
-              <ctyp:Property xsi:type="ctyp:ContentData" propertyId="Content">
-                <ctyp:Value xsi:type="ctyp:Binary">
-                  <xop:Include href="cid:${contentPartId}"/>
-                </ctyp:Value>
-              </ctyp:Property>
-            </ctyp:Value>
-          </ctyp:Property>
-        </ctyp:ActionProperties>
-      </ctyp:ChangeRequest>
+// Lit le contenu XML actuel du FlowFile
+def xmlContent = new ByteArrayOutputStream()
+session.read(flowFile, { inputStream ->
+    IOUtils.copy(inputStream, xmlContent)
+} as InputStreamCallback)
 
-      <!-- ChangeRequest 2 : filer le document dans le dossier X -->
-      <ctyp:ChangeRequest id="2">
-        <ctyp:TargetSpecification xsi:type="ctyp:ObjectStoreSpecification"
-             objectStore="${xmlEscape(osSymbolic)}"/>
+// Construit le corps multipart
+def body = new ByteArrayOutputStream()
 
-        <ctyp:Action xsi:type="ctyp:CreateAction"
-             classId="ReferentialContainmentRelationship"/>
+// --- Partie 1 : json (en premier) ---
+body.write((
+    "--${boundary}\r\n" +
+    "Content-Disposition: form-data; name=\"json\"\r\n" +
+    "Content-Type: application/json\r\n\r\n" +
+    "${jsonPayload}\r\n"
+).getBytes(StandardCharsets.UTF_8))
 
-        <ctyp:ActionProperties>
-          <!-- Head = le dossier cible X, référencé par chemin ou par ID connu -->
-          <ctyp:Property xsi:type="ctyp:SingletonObject" propertyId="Head">
-            <ctyp:Value xsi:type="ctyp:ReferentialContainmentRelationship">
-              <ctyp:SourceSpecification xsi:type="ctyp:PathBasedObjectSpecification"
-                   classId="Folder"
-                   path="${xmlEscape(targetFolderPath)}"/>
-            </ctyp:Value>
-          </ctyp:Property>
+// --- Partie 2 : file (XML) ---
+body.write((
+    "--${boundary}\r\n" +
+    "Content-Disposition: form-data; name=\"file\"; filename=\"${xmlFilename}\"\r\n" +
+    "Content-Type: application/xml\r\n\r\n"
+).getBytes(StandardCharsets.UTF_8))
 
-          <!-- Tail = le document créé au ChangeRequest id="1" (pas encore d'ID réel -> idRef) -->
-          <ctyp:Property xsi:type="ctyp:SingletonObject" propertyId="Tail">
-            <ctyp:Value xsi:type="${docClass}">
-              <ctyp:SourceSpecification xsi:type="ctyp:DependentObjectSpecification"
-                   idRef="1"/>
-            </ctyp:Value>
-          </ctyp:Property>
+body.write(xmlContent.toByteArray())
+body.write("\r\n".getBytes(StandardCharsets.UTF_8))
 
-          <!-- nom d'affichage de l'objet dans ce dossier -->
-          <ctyp:Property xsi:type="ctyp:SingletonString" propertyId="ContainmentName">
-            <ctyp:Value>${xmlEscape(fileName)}</ctyp:Value>
-          </ctyp:Property>
-        </ctyp:ActionProperties>
-      </ctyp:ChangeRequest>
+// --- Fin du multipart ---
+body.write("--${boundary}--\r\n".getBytes(StandardCharsets.UTF_8))
 
-    </ctyp:ExecuteChangesRequest>
-  </soap:Body>
-</soap:Envelope>
+// Écrit le nouveau contenu dans le FlowFile
+flowFile = session.write(flowFile, { outputStream ->
+    outputStream.write(body.toByteArray())
+} as OutputStreamCallback)
+
+// Ajoute l'attribut boundary pour l'utiliser dans le header Content-Type d'InvokeHTTP
+flowFile = session.putAttribute(flowFile, "multipart.boundary", boundary)
+
+session.transfer(flowFile, REL_SUCCESS)
