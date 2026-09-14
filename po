@@ -1,64 +1,50 @@
-{
-  "type": "record",
-  "name": "Document",
-  "namespace": "com.carrefour.filenet",
-  "fields": [
-    {
-      "name": "OsName",
-      "type": "string"
-    },
-    {
-      "name": "sortld",
-      "type": "int"
-    },
-    {
-      "name": "classDoc",
-      "type": "string"
-    },
-    {
-      "name": "parentFolder",
-      "type": "string"
-    },
-    {
-      "name": "fileName",
-      "type": "string"
-    },
-    {
-      "name": "fileBase64",
-      "type": "string"
-    },
-    {
-      "name": "mimeType",
-      "type": "string"
-    },
-    {
-      "name": "metadatas",
-      "type": {
-        "type": "record",
-        "name": "Metadatas",
-        "fields": [
-          {
-            "name": "metadata",
-            "type": {
-              "type": "array",
-              "items": {
-                "type": "record",
-                "name": "Metadata",
-                "fields": [
-                  {
-                    "name": "keyName",
-                    "type": "string"
-                  },
-                  {
-                    "name": "keyValue",
-                    "type": "string"
-                  }
-                ]
-              }
-            }
-          }
-        ]
-      }
-    }
-  ]
-}
+<?xml version="1.0" encoding="UTF-8"?>
+<xsl:stylesheet version="1.0"
+                xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+                xmlns:ctyp="http://www.filenet.com/wsi/types/"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <xsl:output method="xml" indent="yes" encoding="UTF-8" omit-xml-declaration="no"/>
+  <xsl:variable name="checkinMinor" select="'false'"/>
+
+  <xsl:template match="/Root/Document">
+    <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+      <soapenv:Body>
+        <ctyp:ExecuteChangesRequest refresh="true">
+          <ctyp:ChangeRequest id="1">
+            <ctyp:TargetSpecification xsi:type="ctyp:ObjectReference" objectStore="{OsName}"/>
+            <ctyp:Action xsi:type="ctyp:CreateAction" classId="{classDoc}" autoUniqueContainmentName="false" defineSecurityParentage="0"/>
+            <ctyp:Action xsi:type="ctyp:CheckinAction" autoClassify="false" checkinMinorVersion="{$checkinMinor}"/>
+            <ctyp:ActionProperties>
+              <ctyp:Property xsi:type="ctyp:SingletonString" propertyId="DocumentTitle">
+                <ctyp:Value><xsl:value-of select="fileName"/></ctyp:Value>
+              </ctyp:Property>
+              <ctyp:Property xsi:type="ctyp:SingletonString" propertyId="MimeType">
+                <ctyp:Value><xsl:value-of select="mimeType"/></ctyp:Value>
+              </ctyp:Property>
+              <xsl:for-each select="metadatas/metadata">
+              <ctyp:Property xsi:type="ctyp:SingletonString" propertyId="{keyName}">
+                <ctyp:Value><xsl:value-of select="keyValue"/></ctyp:Value>
+              </ctyp:Property>
+              </xsl:for-each>
+              <ctyp:Property xsi:type="ctyp:ListOfObject" propertyId="ContentElements" listMode="Replace">
+                <ctyp:Value classId="ContentTransfer" dependentAction="Insert">
+                  <ctyp:Property xsi:type="ctyp:SingletonString" propertyId="RetrievalName">
+                    <ctyp:Value><xsl:value-of select="fileName"/></ctyp:Value>
+                  </ctyp:Property>
+                  <ctyp:Property xsi:type="ctyp:SingletonString" propertyId="ContentType">
+                    <ctyp:Value><xsl:value-of select="mimeType"/></ctyp:Value>
+                  </ctyp:Property>
+                  <ctyp:Property xsi:type="ctyp:ContentData" propertyId="Content">
+                    <ctyp:Value xsi:type="ctyp:InlineContent" size="{string-length(fileBase64)}">
+                      <ctyp:Binary><xsl:value-of select="fileBase64"/></ctyp:Binary>
+                    </ctyp:Value>
+                  </ctyp:Property>
+                </ctyp:Value>
+              </ctyp:Property>
+            </ctyp:ActionProperties>
+          </ctyp:ChangeRequest>
+        </ctyp:ExecuteChangesRequest>
+      </soapenv:Body>
+    </soapenv:Envelope>
+  </xsl:template>
+</xsl:stylesheet>
