@@ -1,1 +1,3 @@
-{"sortld":"${sortld}","code":0,"message":"SUCCESS","documentId":"${newDocId}","versionsld":"${versionSeriesId}","arenderLink":"${arender.base.url}/view?docid=${newDocId:urlEncode()}"}
+{"UploadDocumentResponse":{"code":0,"message":"SUCCESS","documents":{"document":[
+Demarcator	,
+Footer	]}}}
