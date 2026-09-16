@@ -1,3 +1,1 @@
-${now():format("yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")}
-${now():toNumber():plus(300000):format("yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")}
-${UUID():base64Encode()}
+{"sortld":"${sortld}","code":0,"message":"SUCCESS","documentId":"${newDocId}","versionsld":"${versionSeriesId}","arenderLink":"${arender.base.url}/view?docid=${newDocId:urlEncode()}"}
