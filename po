@@ -14,7 +14,7 @@
         <ctyp:TargetSpecification xsi:type="ctyp:ObjectStoreSpecification" objectStore="{OsName}"/>
 
         <!-- Un dossier n'est pas versionne : pas de CheckinAction -->
-        <ctyp:Action xsi:type="ctyp:CreateAction" classId="{classFolder}"/>
+        <ctyp:Action xsi:type="ctyp:CreateAction" classId="{folderClass}"/>
 
         <ctyp:ActionProperties>
 
@@ -27,7 +27,7 @@
             <ctyp:Value xsi:type="ctyp:ObjectReference"
                         objectStore="{OsName}"
                         classId="Folder"
-                        objectId="{parentFolder}"/>
+                        objectId="{parentId}"/>
           </ctyp:Property>
 
           <!-- Une Property par entree de metadata, quel que soit leur nombre (0 inclus) -->
