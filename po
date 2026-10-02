@@ -1,34 +1,44 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
-                   xmlns:ctyp="http://www.filenet.com/wsi/types/"
-                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-  <soapenv:Header>
-    <wsse:Security soapenv:mustUnderstand="1"
-                    xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
-                    xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
-      <wsu:Timestamp wsu:Id="TS-1">
-        <wsu:Created>${wsu.created}</wsu:Created>
-        <wsu:Expires>${wsu.expires}</wsu:Expires>
-      </wsu:Timestamp>
-      <wsse:UsernameToken>
-        <wsse:Username>${filenet.username}</wsse:Username>
-        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-username-token-profile-1.0#PasswordText">${filenet.password}</wsse:Password>
-        <wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">${wsu.nonce}</wsse:Nonce>
-        <wsu:Created>${wsu.created}</wsu:Created>
-      </wsse:UsernameToken>
-    </wsse:Security>
-  </soapenv:Header>
-  <soapenv:Body>
-    <ctyp:GetObjectsRequest>
-      <ctyp:ObjectRequest id="1">
-        <ctyp:SourceSpecification xsi:type="ctyp:ObjectSpecification"
-                                   objectStore="${OsName}"
-                                   classId="Folder"
-                                   path="${folderPath:escapeXml()}"/>
-        <ctyp:PropertyFilter maxRecursion="0">
-          <ctyp:IncludeProperties value="Id Name PathName"/>
-        </ctyp:PropertyFilter>
-      </ctyp:ObjectRequest>
-    </ctyp:GetObjectsRequest>
-  </soapenv:Body>
-</soapenv:Envelope>
+<xsl:stylesheet version="1.0"
+                xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+                xmlns:ctyp="http://www.filenet.com/wsi/types/"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+  <!-- Fragment insere dans soapenv:Body : PAS de declaration XML -->
+  <xsl:output method="xml" indent="yes" encoding="UTF-8" omit-xml-declaration="yes"/>
+
+  <xsl:template match="/Root/Folder">
+    <ctyp:ExecuteChangesRequest refresh="true">
+      <ctyp:ChangeRequest id="{sortld}">
+
+        <ctyp:TargetSpecification xsi:type="ctyp:ObjectStoreSpecification" objectStore="{OsName}"/>
+
+        <!-- Un dossier n'est pas versionne : pas de CheckinAction -->
+        <ctyp:Action xsi:type="ctyp:CreateAction" classId="{classFolder}"/>
+
+        <ctyp:ActionProperties>
+
+          <ctyp:Property xsi:type="ctyp:SingletonString" propertyId="FolderName">
+            <ctyp:Value><xsl:value-of select="folderName"/></ctyp:Value>
+          </ctyp:Property>
+
+          <!-- La hierarchie passe par la propriete Parent : aucun RCR necessaire -->
+          <ctyp:Property xsi:type="ctyp:SingletonObject" propertyId="Parent">
+            <ctyp:Value xsi:type="ctyp:ObjectReference"
+                        objectStore="{OsName}"
+                        classId="Folder"
+                        objectId="{parentFolder}"/>
+          </ctyp:Property>
+
+          <!-- Une Property par entree de metadata, quel que soit leur nombre (0 inclus) -->
+          <xsl:for-each select="metadatas/metadata">
+          <ctyp:Property xsi:type="ctyp:SingletonString" propertyId="{keyName}">
+            <ctyp:Value><xsl:value-of select="keyValue"/></ctyp:Value>
+          </ctyp:Property>
+          </xsl:for-each>
+
+        </ctyp:ActionProperties>
+      </ctyp:ChangeRequest>
+    </ctyp:ExecuteChangesRequest>
+  </xsl:template>
+</xsl:stylesheet>
