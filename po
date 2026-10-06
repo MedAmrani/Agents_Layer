@@ -1,44 +1,76 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<xsl:stylesheet version="1.0"
-                xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
-                xmlns:ctyp="http://www.filenet.com/wsi/types/"
-                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+/*
+ * NiFi ExecuteGroovyScript: replaces InvokeHTTP.
+ * Sends the FlowFile content (an already prepared multipart body) as a POST,
+ * with an OAuth2 token taken from an existing controller service.
+ *
+ * Processor setup (dynamic properties, added with "+"):
+ *   CTL.oauth  -> select the controller service "kokooauth2"
+ *   apiKey     -> #{api_key}   (or the literal key)
+ *
+ * Input FlowFile (e.g. from GenerateFlowFile):
+ *   content = the full multipart body, starting with the line "--<boundary>"
+ *
+ * The boundary is read from the first line of the content.
+ * The API response body replaces the FlowFile content.
+ */
+import org.apache.nifi.processor.io.OutputStreamCallback
 
-  <!-- Fragment insere dans soapenv:Body : PAS de declaration XML -->
-  <xsl:output method="xml" indent="yes" encoding="UTF-8" omit-xml-declaration="yes"/>
+def ff = session.get()
+if (!ff) return
 
-  <xsl:template match="/Root/Folder">
-    <ctyp:ExecuteChangesRequest refresh="true">
-      <ctyp:ChangeRequest id="{sortld}">
+// ---- settings -------------------------------------------------------------
+def url     = 'https://heellowworl.com/lo'
+def fixCrlf = true   // convert line endings to \r\n, as multipart requires
+// ---------------------------------------------------------------------------
 
-        <ctyp:TargetSpecification xsi:type="ctyp:ObjectStoreSpecification" objectStore="{OsName}"/>
+try {
+    // Read the prepared body from the FlowFile
+    def buffer = new ByteArrayOutputStream()
+    session.exportTo(ff, buffer)
+    def text = buffer.toString('UTF-8')
 
-        <!-- Un dossier n'est pas versionne : pas de CheckinAction -->
-        <ctyp:Action xsi:type="ctyp:CreateAction" classId="{folderClass}"/>
+    // Boundary = first non-empty line, without the leading "--"
+    def firstLine = text.readLines().find { it.trim() }?.trim()
+    if (!firstLine?.startsWith('--')) {
+        throw new IllegalStateException('Content must start with a "--<boundary>" line')
+    }
+    def boundary = firstLine.substring(2)
 
-        <ctyp:ActionProperties>
+    if (fixCrlf) {
+        text = text.replaceAll(/\r?\n/, '\r\n')
+        if (!text.endsWith('\r\n')) text += '\r\n'
+    }
+    byte[] payload = text.getBytes('UTF-8')
 
-          <ctyp:Property xsi:type="ctyp:SingletonString" propertyId="FolderName">
-            <ctyp:Value><xsl:value-of select="folderName"/></ctyp:Value>
-          </ctyp:Property>
+    // Token from the controller service (it handles caching and refresh)
+    def token = CTL.oauth.getAccessDetails().getAccessToken()
+    def key   = apiKey.evaluateAttributeExpressions(ff).value
 
-          <!-- La hierarchie passe par la propriete Parent : aucun RCR necessaire -->
-          <ctyp:Property xsi:type="ctyp:SingletonObject" propertyId="Parent">
-            <ctyp:Value xsi:type="ctyp:ObjectReference"
-                        objectStore="{OsName}"
-                        classId="Folder"
-                        objectId="{parentId}"/>
-          </ctyp:Property>
+    // Send it
+    def conn = (HttpURLConnection) new URL(url).openConnection()
+    conn.requestMethod  = 'POST'
+    conn.doOutput       = true
+    conn.connectTimeout = 15000
+    conn.readTimeout    = 60000
+    conn.setFixedLengthStreamingMode(payload.length)
+    conn.setRequestProperty('Authorization', "Bearer ${token}")
+    conn.setRequestProperty('Content-Type', "multipart/form-data; boundary=${boundary}")
+    conn.setRequestProperty('X-BOBO', 'PPLLII')
+    conn.setRequestProperty('apiKey', key)
+    conn.outputStream.withStream { it.write(payload) }
 
-          <!-- Une Property par entree de metadata, quel que soit leur nombre (0 inclus) -->
-          <xsl:for-each select="metadatas/metadata">
-          <ctyp:Property xsi:type="ctyp:SingletonString" propertyId="{keyName}">
-            <ctyp:Value><xsl:value-of select="keyValue"/></ctyp:Value>
-          </ctyp:Property>
-          </xsl:for-each>
+    // Read the response
+    int status = conn.responseCode
+    def stream = status < 400 ? conn.inputStream : conn.errorStream
+    byte[] response = stream ? stream.bytes : new byte[0]
+    conn.disconnect()
 
-        </ctyp:ActionProperties>
-      </ctyp:ChangeRequest>
-    </ctyp:ExecuteChangesRequest>
-  </xsl:template>
-</xsl:stylesheet>
+    ff = session.write(ff, { out -> out.write(response) } as OutputStreamCallback)
+    ff = session.putAttribute(ff, 'http.status.code', String.valueOf(status))
+    session.transfer(ff, (status >= 200 && status < 300) ? REL_SUCCESS : REL_FAILURE)
+
+} catch (Exception e) {
+    log.error('Multipart POST failed', e)
+    ff = session.putAttribute(ff, 'error.message', e.toString())
+    session.transfer(ff, REL_FAILURE)
+}
