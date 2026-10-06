@@ -6,6 +6,8 @@
  * Processor setup (dynamic properties, added with "+"):
  *   CTL.oauth  -> select the controller service "kokooauth2"
  *   apiKey     -> #{api_key}   (or the literal key)
+ *   CTL.ssl    -> select your StandardSSLContextService
+ *   CTL.proxy  -> select your proxy configuration service
  *
  * Input FlowFile (e.g. from GenerateFlowFile):
  *   content = the full multipart body, starting with the line "--<boundary>"
@@ -13,6 +15,7 @@
  * The boundary is read from the first line of the content.
  * The API response body replaces the FlowFile content.
  */
+import javax.net.ssl.HttpsURLConnection
 import org.apache.nifi.processor.io.OutputStreamCallback
 
 def ff = session.get()
@@ -47,7 +50,16 @@ try {
     def key   = apiKey.evaluateAttributeExpressions(ff).value
 
     // Send it
-    def conn = (HttpURLConnection) new URL(url).openConnection()
+    def proxy = Proxy.NO_PROXY
+    if (CTL.containsKey('proxy')) {
+        // Host, port and type from the proxy configuration service
+        proxy = CTL.proxy.getConfiguration().createProxy()
+    }
+    def conn = (HttpURLConnection) new URL(url).openConnection(proxy)
+    if (conn instanceof HttpsURLConnection && CTL.containsKey('ssl')) {
+        // Keystore / truststore from the StandardSSLContextService
+        conn.setSSLSocketFactory(CTL.ssl.createContext().socketFactory)
+    }
     conn.requestMethod  = 'POST'
     conn.doOutput       = true
     conn.connectTimeout = 15000
