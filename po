@@ -1,124 +1,48 @@
-/*
- * NiFi - ExecuteScript (Script Engine = Groovy) ou ExecuteGroovyScript
- * Convertit un "faux" .xls (tableau HTML) en CSV UTF-8.
- * Aucune librairie externe : uniquement Groovy / Java standard.
- */
 import org.apache.nifi.processor.io.StreamCallback
-import java.nio.charset.Charset
 import java.nio.charset.StandardCharsets
-import java.util.regex.Pattern
 
 def flowFile = session.get()
 if (!flowFile) return
 
-// ------------------------- Paramètres -------------------------
-String DELIM          = ','                                   // ';' pour Excel en français
-String FORCED_CHARSET = flowFile.getAttribute('html.charset') // optionnel, ex. windows-1252
-int    TABLE_INDEX    = 0                                     // 0 = premier <table>
-// --------------------------------------------------------------
-
-Pattern P_JUNK    = Pattern.compile($/(?is)<!--.*?-->|<script\b.*?</script>|<style\b.*?</style>/$)
-Pattern P_TABLE   = Pattern.compile($/(?is)<table\b[^>]*>(.*?)</table>/$)
-Pattern P_ROW     = Pattern.compile($/(?is)<tr\b[^>]*>(.*?)(?=<tr\b|\z)/$)
-Pattern P_CELL    = Pattern.compile($/(?is)<t[dh]\b([^>]*)>(.*?)(?=<t[dh]\b|</tr>|\z)/$)
-Pattern P_COLSPAN = Pattern.compile($/(?i)colspan\s*=\s*["']?(\d+)/$)
-Pattern P_CHARSET = Pattern.compile($/(?i)charset\s*=\s*["']?([\w.:-]+)/$)
-
-Map<String, String> ENTITIES = [
-    nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
-    eacute: 'é', egrave: 'è', ecirc: 'ê', euml: 'ë', agrave: 'à', acirc: 'â',
-    ccedil: 'ç', ocirc: 'ô', ouml: 'ö', ugrave: 'ù', ucirc: 'û', uuml: 'ü',
-    icirc: 'î', iuml: 'ï', Eacute: 'É', Egrave: 'È', Agrave: 'À', Ccedil: 'Ç',
-    euro: '€', deg: '°', laquo: '«', raquo: '»', rsquo: '’', lsquo: '‘',
-    rdquo: '”', ldquo: '“', hellip: '…', ndash: '–', mdash: '—', copy: '©', reg: '®'
-]
-
-// Détection de l'encodage : attribut forcé > BOM > <meta charset> > UTF-8
-def detectCharset = { byte[] b ->
-    if (FORCED_CHARSET) return Charset.forName(FORCED_CHARSET)
-    if (b.length >= 3 && (b[0] & 0xFF) == 0xEF && (b[1] & 0xFF) == 0xBB && (b[2] & 0xFF) == 0xBF) return StandardCharsets.UTF_8
-    if (b.length >= 2 && (b[0] & 0xFF) == 0xFF && (b[1] & 0xFF) == 0xFE) return StandardCharsets.UTF_16LE
-    if (b.length >= 2 && (b[0] & 0xFF) == 0xFE && (b[1] & 0xFF) == 0xFF) return StandardCharsets.UTF_16BE
-    def m = P_CHARSET.matcher(new String(b, 0, Math.min(b.length, 4096), StandardCharsets.ISO_8859_1))
-    if (m.find()) {
-        try { return Charset.forName(m.group(1)) } catch (e) { /* charset inconnu */ }
-    }
-    return StandardCharsets.UTF_8
-}
-
-// Décodage des entités HTML (nommées, &#233; et &#xE9;)
-def decode = { String s ->
-    s.replaceAll($/&(#[xX][0-9a-fA-F]+|#\d+|[a-zA-Z][a-zA-Z0-9]*);/$) { String all, String code ->
-        try {
-            if (code.startsWith('#x') || code.startsWith('#X'))
-                return new String(Character.toChars(Integer.parseInt(code.substring(2), 16)))
-            if (code.startsWith('#'))
-                return new String(Character.toChars(Integer.parseInt(code.substring(1))))
-        } catch (e) { return all }
-        ENTITIES[code] ?: all
-    }
-}
-
-// Contenu d'une cellule -> texte brut
-def cleanCell = { String html ->
-    String t = html.replaceAll($/(?i)<br\s*/?>/$, ' ')
-    t = t.replaceAll('<[^>]*>', '')
-    t = decode(t)
-    t.replace(' ', ' ').replaceAll('\\s+', ' ').trim()
-}
-
-// Échappement CSV (guillemets seulement si nécessaire)
-def csv = { String v ->
-    (v.contains(DELIM) || v.contains('"') || v.contains('\n') || v.contains('\r')) ?
-        '"' + v.replace('"', '""') + '"' : v
-}
-
-int rows = 0
 try {
     flowFile = session.write(flowFile, { InputStream inp, OutputStream out ->
-        byte[] bytes = inp.bytes
-        String html = new String(bytes, detectCharset(bytes)).replace('﻿', '')
-        html = P_JUNK.matcher(html).replaceAll('')
+        String html = inp.getText('UTF-8')
 
-        // Sélection du tableau
-        def tm = P_TABLE.matcher(html)
-        String table = null
-        int idx = -1
-        while (tm.find()) {
-            if (++idx == TABLE_INDEX) { table = tm.group(1); break }
-        }
-        if (table == null) throw new IllegalStateException("Aucun <table> d'index ${TABLE_INDEX} trouvé")
+        // 1. Go directly to the table
+        def table = (html =~ /(?is)<table\b.*?<\/table>/)
+        if (!table.find()) throw new Exception("No <table> found")
+        String tableHtml = table.group()
 
-        def w = new BufferedWriter(new OutputStreamWriter(out, StandardCharsets.UTF_8))
-        def rm = P_ROW.matcher(table)
-        while (rm.find()) {
-            List<String> cells = []
-            def cm = P_CELL.matcher(rm.group(1))
-            while (cm.find()) {
-                cells << csv(cleanCell(cm.group(2)))
-                def cs = P_COLSPAN.matcher(cm.group(1))
-                if (cs.find()) {
-                    (Integer.parseInt(cs.group(1)) - 1).times { cells << '' }  // cellules fusionnées
-                }
+        def writer = new OutputStreamWriter(out, StandardCharsets.UTF_8)
+
+        // 2. Each row
+        (tableHtml =~ /(?is)<tr\b[^>]*>(.*?)<\/tr>/).each { rowMatch ->
+            String row = rowMatch[1]
+
+            // 3. Each cell -> clean text -> CSV value
+            def cells = (row =~ /(?is)<t[dh]\b[^>]*>(.*?)<\/t[dh]>/).collect { cellMatch ->
+                String text = cellMatch[1]
+                    .replaceAll(/<[^>]*>/, '')      // remove inner tags
+                    .replace('&nbsp;', ' ')
+                    .replace('&lt;', '<')
+                    .replace('&gt;', '>')
+                    .replace('&quot;', '"')
+                    .replace('&amp;', '&')
+                    .replaceAll(/\s+/, ' ')
+                    .trim()
+                '"' + text.replace('"', '""') + '"'
             }
-            if (cells) {
-                w.write(cells.join(DELIM))
-                w.write('\n')
-                rows++
-            }
+
+            // 4. Write the CSV line
+            if (cells) writer.write(cells.join(',') + '\n')
         }
-        w.flush()
+        writer.flush()
     } as StreamCallback)
 
-    String name = flowFile.getAttribute('filename') ?: 'output'
-    flowFile = session.putAllAttributes(flowFile, [
-        'filename'    : name.replaceAll('(?i)\\.(xls|html?)$', '') + '.csv',
-        'mime.type'   : 'text/csv',
-        'record.count': String.valueOf(rows)
-    ])
+    flowFile = session.putAttribute(flowFile, 'filename',
+        flowFile.getAttribute('filename').replaceAll(/(?i)\.xls$/, '') + '.csv')
     session.transfer(flowFile, REL_SUCCESS)
 } catch (Exception e) {
-    log.error("Conversion HTML-XLS -> CSV échouée pour ${flowFile}", e)
-    flowFile = session.putAttribute(flowFile, 'conversion.error', String.valueOf(e.message))
+    log.error("HTML to CSV failed", e)
     session.transfer(flowFile, REL_FAILURE)
 }
