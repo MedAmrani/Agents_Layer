@@ -1,138 +1,43 @@
-/*
- * NiFi - ExecuteScript (Script Engine = Groovy) ou ExecuteGroovyScript
- * Convertit un "faux" .xls (tableau HTML) en CSV UTF-8.
- * Aucune librairie externe : uniquement Groovy / Java standard.
- */
-import org.apache.nifi.processor.io.StreamCallback
-import java.nio.charset.Charset
-import java.nio.charset.StandardCharsets
-import java.util.regex.Pattern
+<?xml version="1.0" encoding="UTF-8"?>
+<xsl:stylesheet version="1.0"
+                xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+                xmlns:ctyp="http://www.filenet.com/wsi/types/"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
 
-def flowFile = session.get()
-if (!flowFile) return
+  <!-- Fragment insere dans soapenv:Body : PAS de declaration XML -->
+  <xsl:output method="xml" indent="yes" encoding="UTF-8" omit-xml-declaration="yes"/>
 
-// ------------------------- Paramètres -------------------------
-String DELIM          = ','                                   // ';' pour Excel en français
-String FORCED_CHARSET = flowFile.getAttribute('html.charset') // optionnel, ex. windows-1252
-// Which <table> to extract: 0 = first, 1 = second, ...
-// Can be overridden per FlowFile with the attribute "html.table.index"
-int    TABLE_INDEX    = (flowFile.getAttribute('html.table.index') ?: '1') as int
-// --------------------------------------------------------------
+  <xsl:template match="/Root/Document">
 
-Pattern P_JUNK    = Pattern.compile($/(?is)<!--.*?-->|<script\b.*?</script>|<style\b.*?</style>/$)
-Pattern P_TABLE_TAG = Pattern.compile($/(?i)<(/?)table\b[^>]*>/$)
-Pattern P_ROW     = Pattern.compile($/(?is)<tr\b[^>]*>(.*?)(?=<tr\b|\z)/$)
-Pattern P_CELL    = Pattern.compile($/(?is)<t[dh]\b([^>]*)>(.*?)(?=<t[dh]\b|</tr>|\z)/$)
-Pattern P_COLSPAN = Pattern.compile($/(?i)colspan\s*=\s*["']?(\d+)/$)
-Pattern P_CHARSET = Pattern.compile($/(?i)charset\s*=\s*["']?([\w.:-]+)/$)
+    <!-- ALL_VERSIONS  : on cible la VersionSeries  -> toutes les versions partent
+         SINGLE_VERSION: on cible le Document       -> seule cette version part -->
+    <xsl:variable name="targetClass">
+      <xsl:choose>
+        <xsl:when test="deleteMode = 'ALL_VERSIONS'">VersionSeries</xsl:when>
+        <xsl:otherwise><xsl:value-of select="docClass"/></xsl:otherwise>
+      </xsl:choose>
+    </xsl:variable>
 
-Map<String, String> ENTITIES = [
-    nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
-    eacute: 'é', egrave: 'è', ecirc: 'ê', euml: 'ë', agrave: 'à', acirc: 'â',
-    ccedil: 'ç', ocirc: 'ô', ouml: 'ö', ugrave: 'ù', ucirc: 'û', uuml: 'ü',
-    icirc: 'î', iuml: 'ï', Eacute: 'É', Egrave: 'È', Agrave: 'À', Ccedil: 'Ç',
-    euro: '€', deg: '°', laquo: '«', raquo: '»', rsquo: '’', lsquo: '‘',
-    rdquo: '”', ldquo: '“', hellip: '…', ndash: '–', mdash: '—', copy: '©', reg: '®'
-]
+    <xsl:variable name="targetId">
+      <xsl:choose>
+        <xsl:when test="deleteMode = 'ALL_VERSIONS'"><xsl:value-of select="versionSeriesId"/></xsl:when>
+        <xsl:otherwise><xsl:value-of select="documentId"/></xsl:otherwise>
+      </xsl:choose>
+    </xsl:variable>
 
-// Détection de l'encodage : attribut forcé > BOM > <meta charset> > UTF-8
-def detectCharset = { byte[] b ->
-    if (FORCED_CHARSET) return Charset.forName(FORCED_CHARSET)
-    if (b.length >= 3 && (b[0] & 0xFF) == 0xEF && (b[1] & 0xFF) == 0xBB && (b[2] & 0xFF) == 0xBF) return StandardCharsets.UTF_8
-    if (b.length >= 2 && (b[0] & 0xFF) == 0xFF && (b[1] & 0xFF) == 0xFE) return StandardCharsets.UTF_16LE
-    if (b.length >= 2 && (b[0] & 0xFF) == 0xFE && (b[1] & 0xFF) == 0xFF) return StandardCharsets.UTF_16BE
-    def m = P_CHARSET.matcher(new String(b, 0, Math.min(b.length, 4096), StandardCharsets.ISO_8859_1))
-    if (m.find()) {
-        try { return Charset.forName(m.group(1)) } catch (e) { /* charset inconnu */ }
-    }
-    return StandardCharsets.UTF_8
-}
+    <!-- refresh=false : une suppression ne renvoie aucun objet a rafraichir -->
+    <ctyp:ExecuteChangesRequest refresh="false">
+      <ctyp:ChangeRequest id="{sortld}">
 
-// Décodage des entités HTML (nommées, &#233; et &#xE9;)
-def decode = { String s ->
-    s.replaceAll($/&(#[xX][0-9a-fA-F]+|#\d+|[a-zA-Z][a-zA-Z0-9]*);/$) { String all, String code ->
-        try {
-            if (code.startsWith('#x') || code.startsWith('#X'))
-                return new String(Character.toChars(Integer.parseInt(code.substring(2), 16)))
-            if (code.startsWith('#'))
-                return new String(Character.toChars(Integer.parseInt(code.substring(1))))
-        } catch (e) { return all }
-        ENTITIES[code] ?: all
-    }
-}
+        <!-- La cible est l'objet LUI-MEME, pas l'object store -->
+        <ctyp:TargetSpecification xsi:type="ctyp:ObjectReference"
+                                  objectStore="{OsName}"
+                                  classId="{$targetClass}"
+                                  objectId="{$targetId}"/>
 
-// Returns the inner HTML of the n-th <table> (document order of opening tags).
-// Depth-aware, so it also works when the tables are nested.
-def extractTable = { String html, int n ->
-    def tok = P_TABLE_TAG.matcher(html)
-    int count = -1, depth = 0, start = -1
-    while (tok.find()) {
-        boolean closing = tok.group(1) == '/'
-        if (start < 0) {
-            if (!closing && ++count == n) { start = tok.end(); depth = 1 }
-        } else {
-            depth += closing ? -1 : 1
-            if (depth == 0) return html.substring(start, tok.start())
-        }
-    }
-    start >= 0 ? html.substring(start) : null   // missing </table>: take the rest
-}
+        <ctyp:Action xsi:type="ctyp:DeleteAction"/>
 
-// Contenu d'une cellule -> texte brut
-def cleanCell = { String html ->
-    String t = html.replaceAll($/(?i)<br\s*/?>/$, ' ')
-    t = t.replaceAll('<[^>]*>', '')
-    t = decode(t)
-    t.replace(' ', ' ').replaceAll('\\s+', ' ').trim()
-}
-
-// Échappement CSV (guillemets seulement si nécessaire)
-def csv = { String v ->
-    (v.contains(DELIM) || v.contains('"') || v.contains('\n') || v.contains('\r')) ?
-        '"' + v.replace('"', '""') + '"' : v
-}
-
-int rows = 0
-try {
-    flowFile = session.write(flowFile, { InputStream inp, OutputStream out ->
-        byte[] bytes = inp.bytes
-        String html = new String(bytes, detectCharset(bytes)).replace('﻿', '')
-        html = P_JUNK.matcher(html).replaceAll('')
-
-        // Sélection du tableau
-        String table = extractTable(html, TABLE_INDEX)
-        if (table == null) throw new IllegalStateException("Aucun <table> d'index ${TABLE_INDEX} trouvé")
-
-        def w = new BufferedWriter(new OutputStreamWriter(out, StandardCharsets.UTF_8))
-        def rm = P_ROW.matcher(table)
-        while (rm.find()) {
-            List<String> cells = []
-            def cm = P_CELL.matcher(rm.group(1))
-            while (cm.find()) {
-                cells << csv(cleanCell(cm.group(2)))
-                def cs = P_COLSPAN.matcher(cm.group(1))
-                if (cs.find()) {
-                    (Integer.parseInt(cs.group(1)) - 1).times { cells << '' }  // cellules fusionnées
-                }
-            }
-            if (cells) {
-                w.write(cells.join(DELIM))
-                w.write('\n')
-                rows++
-            }
-        }
-        w.flush()
-    } as StreamCallback)
-
-    String name = flowFile.getAttribute('filename') ?: 'output'
-    flowFile = session.putAllAttributes(flowFile, [
-        'filename'    : name.replaceAll('(?i)\\.(xls|html?)$', '') + '.csv',
-        'mime.type'   : 'text/csv',
-        'record.count': String.valueOf(rows)
-    ])
-    session.transfer(flowFile, REL_SUCCESS)
-} catch (Exception e) {
-    log.error("Conversion HTML-XLS -> CSV échouée pour ${flowFile}", e)
-    flowFile = session.putAttribute(flowFile, 'conversion.error', String.valueOf(e.message))
-    session.transfer(flowFile, REL_FAILURE)
-}
+      </ctyp:ChangeRequest>
+    </ctyp:ExecuteChangesRequest>
+  </xsl:template>
+</xsl:stylesheet>
