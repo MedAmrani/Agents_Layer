@@ -7,33 +7,18 @@
   <!-- Fragment insere dans soapenv:Body : PAS de declaration XML -->
   <xsl:output method="xml" indent="yes" encoding="UTF-8" omit-xml-declaration="yes"/>
 
-  <xsl:template match="/Root/Document">
-
-    <!-- ALL_VERSIONS  : on cible la VersionSeries  -> toutes les versions partent
-         SINGLE_VERSION: on cible le Document       -> seule cette version part -->
-    <xsl:variable name="targetClass">
-      <xsl:choose>
-        <xsl:when test="deleteMode = 'ALL_VERSIONS'">VersionSeries</xsl:when>
-        <xsl:otherwise><xsl:value-of select="docClass"/></xsl:otherwise>
-      </xsl:choose>
-    </xsl:variable>
-
-    <xsl:variable name="targetId">
-      <xsl:choose>
-        <xsl:when test="deleteMode = 'ALL_VERSIONS'"><xsl:value-of select="versionSeriesId"/></xsl:when>
-        <xsl:otherwise><xsl:value-of select="documentId"/></xsl:otherwise>
-      </xsl:choose>
-    </xsl:variable>
-
+  <xsl:template match="/Root/Folder">
     <!-- refresh=false : une suppression ne renvoie aucun objet a rafraichir -->
     <ctyp:ExecuteChangesRequest refresh="false">
       <ctyp:ChangeRequest id="{sortld}">
 
-        <!-- La cible est l'objet LUI-MEME, pas l'object store -->
+        <!-- Difference cle avec un create : la cible est l'objet LUI-MEME,
+             pas l'object store dans lequel on cree. D'ou ObjectReference
+             avec objectId, et non ObjectStoreSpecification. -->
         <ctyp:TargetSpecification xsi:type="ctyp:ObjectReference"
                                   objectStore="{OsName}"
-                                  classId="{$targetClass}"
-                                  objectId="{$targetId}"/>
+                                  classId="{folderClass}"
+                                  objectId="{folderId}"/>
 
         <ctyp:Action xsi:type="ctyp:DeleteAction"/>
 
