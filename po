@@ -1,28 +1,16 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<xsl:stylesheet version="1.0"
-                xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
-                xmlns:ctyp="http://www.filenet.com/wsi/types/"
-                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-
-  <!-- Fragment insere dans soapenv:Body : PAS de declaration XML -->
-  <xsl:output method="xml" indent="yes" encoding="UTF-8" omit-xml-declaration="yes"/>
-
-  <xsl:template match="/Root/Folder">
-    <!-- refresh=false : une suppression ne renvoie aucun objet a rafraichir -->
-    <ctyp:ExecuteChangesRequest refresh="false">
-      <ctyp:ChangeRequest id="{sortld}">
-
-        <!-- Difference cle avec un create : la cible est l'objet LUI-MEME,
-             pas l'object store dans lequel on cree. D'ou ObjectReference
-             avec objectId, et non ObjectStoreSpecification. -->
-        <ctyp:TargetSpecification xsi:type="ctyp:ObjectReference"
-                                  objectStore="{OsName}"
-                                  classId="{folderClass}"
-                                  objectId="{folderId}"/>
-
-        <ctyp:Action xsi:type="ctyp:DeleteAction"/>
-
-      </ctyp:ChangeRequest>
-    </ctyp:ExecuteChangesRequest>
-  </xsl:template>
-</xsl:stylesheet>
+[
+  {
+    "cdo_id": "12",
+    "cdo_name": "Consent CDO 1",
+    "fields": {
+      "email":         "{{CustomObject[12].Field[101]}}",
+      "phone":         "{{CustomObject[12].Field[102]}}",
+      "legalEntity":   "{{CustomObject[12].Field[103]}}",
+      "consentEmail":  "{{CustomObject[12].Field[104]}}",
+      "consentPhone":  "{{CustomObject[12].Field[105]}}",
+      "consentSms":    "{{CustomObject[12].Field[106]}}",
+      "consentPostal": "{{CustomObject[12].Field[107]}}",
+      "updatedAt":     "{{CustomObject[12].UpdatedAt}}"
+    }
+  }
+]
