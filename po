@@ -1,16 +1,17 @@
 [
   {
-    "cdo_id": "12",
-    "cdo_name": "Consent CDO 1",
-    "fields": {
-      "email":         "{{CustomObject[12].Field[101]}}",
-      "phone":         "{{CustomObject[12].Field[102]}}",
-      "legalEntity":   "{{CustomObject[12].Field[103]}}",
-      "consentEmail":  "{{CustomObject[12].Field[104]}}",
-      "consentPhone":  "{{CustomObject[12].Field[105]}}",
-      "consentSms":    "{{CustomObject[12].Field[106]}}",
-      "consentPostal": "{{CustomObject[12].Field[107]}}",
-      "updatedAt":     "{{CustomObject[12].UpdatedAt}}"
+    "operation": "shift",
+    "spec": {
+      "data": {
+        "*": {
+          "code": {
+            "#SUfsdfCCESS": "data[&2].statfdsdus",
+            "#sdfds": "data[&2].dsfds"
+          },
+          "*": "data[&1].&"
+        }
+      },
+      "*": "&"
     }
   }
 ]
